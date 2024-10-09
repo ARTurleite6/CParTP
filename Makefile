@@ -1,4 +1,4 @@
-CPP = g++ -Wall 
+CPP = g++ -Wall -O2 --std=c++20
 SRCS = main.cpp fluid_solver.cpp EventManager.cpp
 
 all:
