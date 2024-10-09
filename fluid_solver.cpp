@@ -1,6 +1,8 @@
 #include "fluid_solver.h"
 #include <cmath>
+#include <iostream>
 
+#define BLOCK_SIZE 8
 #define IX(i, j, k) ((i) + (M + 2) * (j) + (M + 2) * (N + 2) * (k))
 #define SWAP(x0, x)                                                            \
   {                                                                            \
@@ -56,25 +58,28 @@ void set_bnd(int M, int N, int O, int b, float *x) {
 // Linear solve for implicit methods (diffusion)
 void lin_solve(int M, int N, int O, int b, float *x, float *x0, float a,
                float c) {
-  float c_inv = 1.0f / c;
+  const double inv_c = 1.0 / c;
+  const unsigned int slice_size = (M + 2) * (N + 2);
+
   for (int l = 0; l < LINEARSOLVERTIMES; l++) {
-    for (int i = 1; i <= M; i++) {
-      for (int j = 1; j <= N; j++) {
-        for (int k = 1; k <= O; k++) {
-          const unsigned int x_center_idx = IX(i, j, k);
-          const float x_center = x0[x_center_idx];
-          const float x_left = x[IX(i - 1, j, k)];
-          const float x_right = x[IX(i + 1, j, k)];
-          const float x_down = x[IX(i, j - 1, k)];
-          const float x_up = x[IX(i, j + 1, k)];
-          const float x_back = x[IX(i, j, k - 1)];
-          const float x_front = x[IX(i, j, k + 1)];
+    for (int kk = 1; kk <= O; kk += BLOCK_SIZE) {
+      for (int jj = 1; jj <= N; jj += BLOCK_SIZE) {
+        for (int ii = 1; ii <= M; ii += BLOCK_SIZE) {
+          for (int k = kk; k < kk + BLOCK_SIZE && k <= O; k++) {
+            const int k_index = slice_size * k;
+            for (int j = jj; j < jj + BLOCK_SIZE && j <= N; j++) {
+              const int kj_index = (M + 2) * j + k_index;
+              for (int i = ii; i < ii + BLOCK_SIZE && i <= M; i++) {
+                int index = kj_index + i;
+                float sum = x0[index];
+                sum += a * (x[index - 1] + x[index + 1] + x[index - (M + 2)] +
+                            x[index + (M + 2)] + x[index - slice_size] +
+                            x[index + slice_size]);
 
-          const float sum_neighbors =
-              x_left + x_right + x_down + x_up + x_back + x_front;
-          const float weighted_sum = x_center + a * sum_neighbors;
-
-          x[x_center_idx] = weighted_sum * c_inv;
+                x[index] = sum * inv_c;
+              }
+            }
+          }
         }
       }
     }
