@@ -26,20 +26,20 @@ void set_bnd(int M, int N, int O, int b, float *x) {
   int i, j;
 
   // Set boundary on faces
-  for (i = 1; i <= M; i++) {
-    for (j = 1; j <= N; j++) {
+  for (j = 1; j <= N; j++) {
+    for (i = 1; i <= M; i++) {
       x[IX(i, j, 0)] = b == 3 ? -x[IX(i, j, 1)] : x[IX(i, j, 1)];
       x[IX(i, j, O + 1)] = b == 3 ? -x[IX(i, j, O)] : x[IX(i, j, O)];
     }
   }
-  for (i = 1; i <= N; i++) {
-    for (j = 1; j <= O; j++) {
+  for (j = 1; j <= O; j++) {
+    for (i = 1; i <= N; i++) {
       x[IX(0, i, j)] = b == 1 ? -x[IX(1, i, j)] : x[IX(1, i, j)];
       x[IX(M + 1, i, j)] = b == 1 ? -x[IX(M, i, j)] : x[IX(M, i, j)];
     }
   }
-  for (i = 1; i <= M; i++) {
-    for (j = 1; j <= O; j++) {
+  for (j = 1; j <= O; j++) {
+    for (i = 1; i <= M; i++) {
       x[IX(i, 0, j)] = b == 2 ? -x[IX(i, 1, j)] : x[IX(i, 1, j)];
       x[IX(i, N + 1, j)] = b == 2 ? -x[IX(i, N, j)] : x[IX(i, N, j)];
     }
@@ -58,8 +58,8 @@ void set_bnd(int M, int N, int O, int b, float *x) {
 // Linear solve for implicit methods (diffusion)
 void lin_solve(int M, int N, int O, int b, float *x, float *x0, float a,
                float c) {
-  const double inv_c = 1.0 / c;
   const unsigned int slice_size = (M + 2) * (N + 2);
+  const float a_div_c = a / c;
 
   for (int l = 0; l < LINEARSOLVERTIMES; l++) {
     for (int kk = 1; kk <= O; kk += BLOCK_SIZE) {
@@ -71,12 +71,12 @@ void lin_solve(int M, int N, int O, int b, float *x, float *x0, float a,
               const int kj_index = (M + 2) * j + k_index;
               for (int i = ii; i < ii + BLOCK_SIZE && i <= M; i++) {
                 int index = kj_index + i;
-                float sum = x0[index];
-                sum += a * (x[index - 1] + x[index + 1] + x[index - (M + 2)] +
-                            x[index + (M + 2)] + x[index - slice_size] +
-                            x[index + slice_size]);
+                double sum = x0[index] / c;
+                sum += a_div_c * (x[index - 1] + x[index + 1] + x[index - (M + 2)] +
+                        x[index + (M + 2)] + x[index - slice_size] +
+                        x[index + slice_size]);
 
-                x[index] = sum * inv_c;
+                x[index] = sum;
               }
             }
           }
