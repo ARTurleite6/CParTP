@@ -1,6 +1,6 @@
 #include "fluid_solver.h"
 
-#define BLOCK_SIZE 8
+#define BLOCK_SIZE 4
 
 #define IX(i, j, k) ((i) + (M + 2) * (j) + (M + 2) * (N + 2) * (k))
 #define SWAP(x0, x)  \
