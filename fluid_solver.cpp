@@ -1,73 +1,54 @@
 #include "fluid_solver.h"
+#include <math.h>
+#include <omp.h>
+#include <stdio.h>
 
 #define BLOCK_SIZE 4
 
 #define IX(i, j, k) ((i) + (M + 2) * (j) + (M + 2) * (N + 2) * (k))
-#define SWAP(x0, x)  \
-  {                  \
-    float *tmp = x0; \
-    x0 = x;          \
-    x = tmp;         \
+#define SWAP(x0, x)                                                            \
+  {                                                                            \
+    float *tmp = x0;                                                           \
+    x0 = x;                                                                    \
+    x = tmp;                                                                   \
   }
 #define MAX(a, b) (((a) > (b)) ? (a) : (b))
 #define LINEARSOLVERTIMES 20
 
 // Add sources (density or velocity)
-void add_source(int M, int N, int O, float *x, float *s, float dt)
-{
+void add_source(int M, int N, int O, float *x, float *s, float dt) {
   int size = (M + 2) * (N + 2) * (O + 2);
-  for (int i = 0; i < size; i++)
-  {
+  for (int i = 0; i < size; i++) {
     x[i] += dt * s[i];
   }
 }
 
 // Set boundary conditions
-void set_bnd(int M, int N, int O, int b, float *x)
-{
+void set_bnd(int M, int N, int O, int b, float *x) {
   int i, j;
 
   auto neg_mask = (b == 3) ? -1.0F : 1.0F;
 
-  // Set boundary on faces
-  for (j = 1; j <= N; j++)
-  {
-    const auto index = IX(0, j, 0);
-    const auto first_index = IX(0, j, 1);
-    const auto last_index = IX(0, j, O);
-    for (i = 1; i <= M; i++)
-    {
-      const auto first_value = x[first_index + i];
-      const auto last_value = x[last_index + i];
-      x[index + i] = neg_mask * first_value;
-      x[IX(i, j, O + 1)] = neg_mask * last_value;
+  for (int j = 1; j <= N; j++) {
+    for (int i = 1; i <= M; i++) {
+      x[IX(i, j, 0)] = neg_mask * x[IX(i, j, 1)];
+      x[IX(i, j, O + 1)] = neg_mask * x[IX(i, j, O)];
     }
   }
 
   neg_mask = (b == 1) ? -1.0F : 1.0F;
-  for (j = 1; j <= O; j++)
-  {
-    for (i = 1; i <= N; i++)
-    {
-      const auto first_value = x[IX(1, i, j)];
-      const auto last_value = x[IX(M, i, j)];
-      x[IX(0, i, j)] = neg_mask * first_value;
-      x[IX(M + 1, i, j)] = neg_mask * last_value;
+  for (j = 1; j <= O; j++) {
+    for (i = 1; i <= N; i++) {
+      x[IX(0, i, j)] = neg_mask * x[IX(1, i, j)];
+      x[IX(M + 1, i, j)] = neg_mask * x[IX(M, i, j)];
     }
   }
 
   neg_mask = (b == 2) ? -1.0F : 1.0F;
-  for (j = 1; j <= O; j++)
-  {
-    const auto index = IX(0, 0, j);
-    const auto first_index = IX(0, 1, j);
-    const auto last_index = IX(0, N, j);
-    for (i = 1; i <= M; i++)
-    {
-      const auto first_value = x[first_index + i];
-      const auto last_value = x[last_index + i];
-      x[index + i] = neg_mask * first_value;
-      x[IX(i, N + 1, j)] = neg_mask * last_value;
+  for (j = 1; j <= O; j++) {
+    for (i = 1; i <= M; i++) {
+      x[IX(0, 0, j) + i] = neg_mask * x[IX(i, 1, j)];
+      x[IX(i, N + 1, j)] = neg_mask * x[IX(i, N, j)];
     }
   }
 
@@ -81,27 +62,70 @@ void set_bnd(int M, int N, int O, int b, float *x)
                                     x[IX(M + 1, N + 1, 1)]);
 }
 
+#if 1
+// red-black solver with convergence check
+void lin_solve(int M, int N, int O, int b, float *x, float *x0, float a,
+               float c) {
+  float tol = 1e-7, max_c;
+  int l = 0;
+
+  do {
+    max_c = 0.0f;
+#pragma omp parallel shared(x, max_c)
+    {
+#pragma omp for collapse(2) reduction(max : max_c)
+      for (int j = 1; j <= N; j++) {
+        for (int i = 1; i <= M; i++) {
+          for (int k = 1 + (i + j) % 2; k <= O; k += 2) {
+            float old_x = x[IX(i, j, k)];
+            x[IX(i, j, k)] = (x0[IX(i, j, k)] +
+                              a * (x[IX(i - 1, j, k)] + x[IX(i + 1, j, k)] +
+                                   x[IX(i, j - 1, k)] + x[IX(i, j + 1, k)] +
+                                   x[IX(i, j, k - 1)] + x[IX(i, j, k + 1)])) /
+                             c;
+            float change = fabs(x[IX(i, j, k)] - old_x);
+            if (change > max_c)
+              max_c = change;
+          }
+        }
+      }
+
+#pragma omp for collapse(2) reduction(max : max_c)
+      for (int j = 1; j <= N; j++) {
+        for (int i = 1; i <= M; i++) {
+          for (int k = 1 + (i + j + 1) % 2; k <= O; k += 2) {
+            float old_x = x[IX(i, j, k)];
+            x[IX(i, j, k)] = (x0[IX(i, j, k)] +
+                              a * (x[IX(i - 1, j, k)] + x[IX(i + 1, j, k)] +
+                                   x[IX(i, j - 1, k)] + x[IX(i, j + 1, k)] +
+                                   x[IX(i, j, k - 1)] + x[IX(i, j, k + 1)])) /
+                             c;
+            float change = fabs(x[IX(i, j, k)] - old_x);
+            if (change > max_c)
+              max_c = change;
+          }
+        }
+      }
+    }
+    set_bnd(M, N, O, b, x);
+  } while (max_c > tol && ++l < 20);
+}
+
+#else
+
 // Linear solve for implicit methods (diffusion)
 void lin_solve(int M, int N, int O, int b, float *x, float *x0, float a,
-               float c)
-{
+               float c) {
   const float a_div_c = a / c;
   const float inv_c = 1.0f / c;
 
-  for (int l = 0; l < LINEARSOLVERTIMES; l++)
-  {
-    for (int kk = 1; kk <= O; kk += BLOCK_SIZE)
-    {
-      for (int jj = 1; jj <= N; jj += BLOCK_SIZE)
-      {
-        for (int ii = 1; ii <= M; ii += BLOCK_SIZE)
-        {
-          for (int k = kk; k < kk + BLOCK_SIZE && k <= O; k++)
-          {
-            for (int j = jj; j < jj + BLOCK_SIZE && j <= N; j++)
-            {
-              for (int i = ii; i < ii + BLOCK_SIZE && i <= M; i++)
-              {
+  for (int l = 0; l < LINEARSOLVERTIMES; l++) {
+    for (int kk = 1; kk <= O; kk += BLOCK_SIZE) {
+      for (int jj = 1; jj <= N; jj += BLOCK_SIZE) {
+        for (int ii = 1; ii <= M; ii += BLOCK_SIZE) {
+          for (int k = kk; k < kk + BLOCK_SIZE && k <= O; k++) {
+            for (int j = jj; j < jj + BLOCK_SIZE && j <= N; j++) {
+              for (int i = ii; i < ii + BLOCK_SIZE && i <= M; i++) {
                 const auto index = IX(i, j, k);
                 const auto result =
                     (x0[index] * inv_c +
@@ -119,10 +143,11 @@ void lin_solve(int M, int N, int O, int b, float *x, float *x0, float a,
   }
 }
 
+#endif
+
 // Diffusion step (uses implicit method)
 void diffuse(int M, int N, int O, int b, float *x, float *x0, float diff,
-             float dt)
-{
+             float dt) {
   int max = MAX(MAX(M, N), O);
   float a = dt * diff * max * max;
   lin_solve(M, N, O, b, x, x0, a, 1 + 6 * a);
@@ -130,16 +155,12 @@ void diffuse(int M, int N, int O, int b, float *x, float *x0, float diff,
 
 // Advection step (uses velocity field to move quantities)
 void advect(int M, int N, int O, int b, float *d, float *d0, float *u, float *v,
-            float *w, float dt)
-{
+            float *w, float dt) {
   float dtX = dt * M, dtY = dt * N, dtZ = dt * O;
-
-  for (int k = 1; k <= O; k++)
-  {
-    for (int j = 1; j <= N; j++)
-    {
-      for (int i = 1; i <= M; i++)
-      {
+#pragma omp parallel for collapse(3)
+  for (int k = 1; k <= O; k++) {
+    for (int j = 1; j <= N; j++) {
+      for (int i = 1; i <= M; i++) {
         const auto index = IX(i, j, k);
         float x = i - dtX * u[index];
         float y = j - dtY * v[index];
@@ -181,16 +202,13 @@ void advect(int M, int N, int O, int b, float *d, float *d0, float *u, float *v,
 // Projection step to ensure incompressibility (make the velocity field
 // divergence-free)
 void project(int M, int N, int O, float *u, float *v, float *w, float *p,
-             float *div)
-{
+             float *div) {
   const auto scale = -0.5f;
 
-  for (int k = 1; k <= O; k++)
-  {
-    for (int j = 1; j <= N; j++)
-    {
-      for (int i = 1; i <= M; i++)
-      {
+#pragma omp parallel for collapse(3)
+  for (int k = 1; k <= O; k++) {
+    for (int j = 1; j <= N; j++) {
+      for (int i = 1; i <= M; i++) {
         div[IX(i, j, k)] =
             scale *
             (u[IX(i + 1, j, k)] - u[IX(i - 1, j, k)] + v[IX(i, j + 1, k)] -
@@ -205,18 +223,17 @@ void project(int M, int N, int O, float *u, float *v, float *w, float *p,
   set_bnd(M, N, O, 0, p);
   lin_solve(M, N, O, 0, p, div, 1, 6);
 
-  for (int k = 1; k <= O; k++)
-  {
-    for (int j = 1; j <= N; j++)
-    {
-      for (int i = 1; i <= M; i++)
-      {
+#pragma omp parallel for collapse(3)
+  for (int k = 1; k <= O; k++) {
+    for (int j = 1; j <= N; j++) {
+      for (int i = 1; i <= M; i++) {
         u[IX(i, j, k)] += scale * (p[IX(i + 1, j, k)] - p[IX(i - 1, j, k)]);
         v[IX(i, j, k)] += scale * (p[IX(i, j + 1, k)] - p[IX(i, j - 1, k)]);
         w[IX(i, j, k)] += scale * (p[IX(i, j, k + 1)] - p[IX(i, j, k - 1)]);
       }
     }
   }
+
   set_bnd(M, N, O, 1, u);
   set_bnd(M, N, O, 2, v);
   set_bnd(M, N, O, 3, w);
@@ -224,8 +241,7 @@ void project(int M, int N, int O, float *u, float *v, float *w, float *p,
 
 // Step function for density
 void dens_step(int M, int N, int O, float *x, float *x0, float *u, float *v,
-               float *w, float diff, float dt)
-{
+               float *w, float diff, float dt) {
   add_source(M, N, O, x, x0, dt);
   SWAP(x0, x);
   diffuse(M, N, O, 0, x, x0, diff, dt);
@@ -235,8 +251,7 @@ void dens_step(int M, int N, int O, float *x, float *x0, float *u, float *v,
 
 // Step function for velocity
 void vel_step(int M, int N, int O, float *u, float *v, float *w, float *u0,
-              float *v0, float *w0, float visc, float dt)
-{
+              float *v0, float *w0, float visc, float dt) {
   add_source(M, N, O, u, u0, dt);
   add_source(M, N, O, v, v0, dt);
   add_source(M, N, O, w, w0, dt);
