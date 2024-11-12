@@ -71,38 +71,42 @@ void lin_solve(int M, int N, int O, int b, float *x, float *x0, float a,
 
   do {
     max_c = 0.0f;
-#pragma omp parallel shared(x, max_c)
+#pragma omp parallel
     {
 #pragma omp for collapse(2) reduction(max : max_c)
-      for (int j = 1; j <= N; j++) {
-        for (int i = 1; i <= M; i++) {
-          for (int k = 1 + (i + j) % 2; k <= O; k += 2) {
+      for (int k = 1; k <= O; k++) {
+        for (int j = 1; j <= N; j++) {
+          for (int i = 1 + ((j + k) & 1); i <= M; i += 2) {
             float old_x = x[IX(i, j, k)];
-            x[IX(i, j, k)] = (x0[IX(i, j, k)] +
-                              a * (x[IX(i - 1, j, k)] + x[IX(i + 1, j, k)] +
-                                   x[IX(i, j - 1, k)] + x[IX(i, j + 1, k)] +
-                                   x[IX(i, j, k - 1)] + x[IX(i, j, k + 1)])) /
-                             c;
-            float change = fabs(x[IX(i, j, k)] - old_x);
+            float new_value = (x0[IX(i, j, k)] +
+                               a * (x[IX(i - 1, j, k)] + x[IX(i + 1, j, k)] +
+                                    x[IX(i, j - 1, k)] + x[IX(i, j + 1, k)] +
+                                    x[IX(i, j, k - 1)] + x[IX(i, j, k + 1)])) /
+                              c;
+            float change = fabs(new_value - old_x);
             if (change > max_c)
               max_c = change;
+
+            x[IX(i, j, k)] = new_value;
           }
         }
       }
 
 #pragma omp for collapse(2) reduction(max : max_c)
-      for (int j = 1; j <= N; j++) {
-        for (int i = 1; i <= M; i++) {
-          for (int k = 1 + (i + j + 1) % 2; k <= O; k += 2) {
+      for (int k = 1; k <= O; k++) {
+        for (int j = 1; j <= N; j++) {
+          for (int i = 1 + ((j + k + 1) & 1); i <= M; i += 2) {
             float old_x = x[IX(i, j, k)];
-            x[IX(i, j, k)] = (x0[IX(i, j, k)] +
-                              a * (x[IX(i - 1, j, k)] + x[IX(i + 1, j, k)] +
-                                   x[IX(i, j - 1, k)] + x[IX(i, j + 1, k)] +
-                                   x[IX(i, j, k - 1)] + x[IX(i, j, k + 1)])) /
-                             c;
-            float change = fabs(x[IX(i, j, k)] - old_x);
+            float new_value = (x0[IX(i, j, k)] +
+                               a * (x[IX(i - 1, j, k)] + x[IX(i + 1, j, k)] +
+                                    x[IX(i, j - 1, k)] + x[IX(i, j + 1, k)] +
+                                    x[IX(i, j, k - 1)] + x[IX(i, j, k + 1)])) /
+                              c;
+            float change = fabs(new_value - old_x);
             if (change > max_c)
               max_c = change;
+
+            x[IX(i, j, k)] = new_value;
           }
         }
       }
@@ -157,7 +161,7 @@ void diffuse(int M, int N, int O, int b, float *x, float *x0, float diff,
 void advect(int M, int N, int O, int b, float *d, float *d0, float *u, float *v,
             float *w, float dt) {
   float dtX = dt * M, dtY = dt * N, dtZ = dt * O;
-#pragma omp parallel for collapse(3)
+#pragma omp parallel for collapse(2)
   for (int k = 1; k <= O; k++) {
     for (int j = 1; j <= N; j++) {
       for (int i = 1; i <= M; i++) {
@@ -205,7 +209,7 @@ void project(int M, int N, int O, float *u, float *v, float *w, float *p,
              float *div) {
   const auto scale = -0.5f;
 
-#pragma omp parallel for collapse(3)
+#pragma omp parallel for collapse(2)
   for (int k = 1; k <= O; k++) {
     for (int j = 1; j <= N; j++) {
       for (int i = 1; i <= M; i++) {
@@ -218,12 +222,11 @@ void project(int M, int N, int O, float *u, float *v, float *w, float *p,
       }
     }
   }
-
   set_bnd(M, N, O, 0, div);
   set_bnd(M, N, O, 0, p);
   lin_solve(M, N, O, 0, p, div, 1, 6);
 
-#pragma omp parallel for collapse(3)
+#pragma omp parallel for collapse(2)
   for (int k = 1; k <= O; k++) {
     for (int j = 1; j <= N; j++) {
       for (int i = 1; i <= M; i++) {
