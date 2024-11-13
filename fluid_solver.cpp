@@ -1,4 +1,5 @@
 #include "fluid_solver.h"
+#include <algorithm>
 #include <math.h>
 #include <omp.h>
 #include <stdio.h>
@@ -84,8 +85,7 @@ void lin_solve(int M, int N, int O, int b, float *x, float *x0, float a,
                                     x[IX(i, j, k - 1)] + x[IX(i, j, k + 1)])) /
                               c;
             float change = fabs(new_value - old_x);
-            if (change > max_c)
-              max_c = change;
+            max_c = std::fmax(max_c, change);
 
             x[IX(i, j, k)] = new_value;
           }
@@ -103,8 +103,7 @@ void lin_solve(int M, int N, int O, int b, float *x, float *x0, float a,
                                     x[IX(i, j, k - 1)] + x[IX(i, j, k + 1)])) /
                               c;
             float change = fabs(new_value - old_x);
-            if (change > max_c)
-              max_c = change;
+            max_c = std::fmax(max_c, change);
 
             x[IX(i, j, k)] = new_value;
           }
@@ -170,23 +169,13 @@ void advect(int M, int N, int O, int b, float *d, float *d0, float *u, float *v,
         float y = j - dtY * v[index];
         float z = k - dtZ * w[index];
 
-        // Clamp to grid boundaries
-        if (x < 0.5f)
-          x = 0.5f;
-        if (x > M + 0.5f)
-          x = M + 0.5f;
-        if (y < 0.5f)
-          y = 0.5f;
-        if (y > N + 0.5f)
-          y = N + 0.5f;
-        if (z < 0.5f)
-          z = 0.5f;
-        if (z > O + 0.5f)
-          z = O + 0.5f;
+        std::clamp(x, 0.5f, M + 0.5f);
+        std::clamp(y, 0.5f, N + 0.5f);
+        std::clamp(z, 0.5f, O + 0.5f);
 
-        int i0 = (int)x, i1 = i0 + 1;
-        int j0 = (int)y, j1 = j0 + 1;
-        int k0 = (int)z, k1 = k0 + 1;
+        int i0 = static_cast<int>(x), i1 = i0 + 1;
+        int j0 = static_cast<int>(y), j1 = j0 + 1;
+        int k0 = static_cast<int>(z), k1 = k0 + 1;
 
         float s1 = x - i0, s0 = 1 - s1;
         float t1 = y - j0, t0 = 1 - t1;
