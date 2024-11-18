@@ -19,6 +19,7 @@
 // Add sources (density or velocity)
 void add_source(int M, int N, int O, float *x, float *s, float dt) {
   int size = (M + 2) * (N + 2) * (O + 2);
+#pragma omp parallel for schedule(static) firstprivate(size)
   for (int i = 0; i < size; i++) {
     x[i] += dt * s[i];
   }
@@ -28,28 +29,33 @@ void add_source(int M, int N, int O, float *x, float *s, float dt) {
 void set_bnd(int M, int N, int O, int b, float *x) {
   int i, j;
 
-  auto neg_mask = (b == 3) ? -1.0F : 1.0F;
-
-  for (int j = 1; j <= N; j++) {
-    for (int i = 1; i <= M; i++) {
-      x[IX(i, j, 0)] = neg_mask * x[IX(i, j, 1)];
-      x[IX(i, j, O + 1)] = neg_mask * x[IX(i, j, O)];
+#pragma omp parallel
+  {
+    auto neg_mask = (b == 3) ? -1.0F : 1.0F;
+#pragma omp for collapse(2) schedule(static) nowait
+    for (int j = 1; j <= N; j++) {
+      for (int i = 1; i <= M; i++) {
+        x[IX(i, j, 0)] = neg_mask * x[IX(i, j, 1)];
+        x[IX(i, j, O + 1)] = neg_mask * x[IX(i, j, O)];
+      }
     }
-  }
 
-  neg_mask = (b == 1) ? -1.0F : 1.0F;
-  for (j = 1; j <= O; j++) {
-    for (i = 1; i <= N; i++) {
-      x[IX(0, i, j)] = neg_mask * x[IX(1, i, j)];
-      x[IX(M + 1, i, j)] = neg_mask * x[IX(M, i, j)];
+    neg_mask = (b == 1) ? -1.0F : 1.0F;
+#pragma omp for collapse(2) schedule(static) nowait
+    for (j = 1; j <= O; j++) {
+      for (i = 1; i <= N; i++) {
+        x[IX(0, i, j)] = neg_mask * x[IX(1, i, j)];
+        x[IX(M + 1, i, j)] = neg_mask * x[IX(M, i, j)];
+      }
     }
-  }
 
-  neg_mask = (b == 2) ? -1.0F : 1.0F;
-  for (j = 1; j <= O; j++) {
-    for (i = 1; i <= M; i++) {
-      x[IX(0, 0, j) + i] = neg_mask * x[IX(i, 1, j)];
-      x[IX(i, N + 1, j)] = neg_mask * x[IX(i, N, j)];
+    neg_mask = (b == 2) ? -1.0F : 1.0F;
+#pragma omp for collapse(2) schedule(static) nowait
+    for (j = 1; j <= O; j++) {
+      for (i = 1; i <= M; i++) {
+        x[IX(i, 0, j)] = neg_mask * x[IX(i, 1, j)];
+        x[IX(i, N + 1, j)] = neg_mask * x[IX(i, N, j)];
+      }
     }
   }
 
@@ -72,9 +78,9 @@ void lin_solve(int M, int N, int O, int b, float *x, float *x0, float a,
 
   do {
     max_c = 0.0f;
-#pragma omp parallel
+#pragma omp parallel firstprivate(tol)
     {
-#pragma omp for collapse(2) reduction(max : max_c)
+#pragma omp for collapse(2) schedule(static) reduction(max : max_c)
       for (int k = 1; k <= O; k++) {
         for (int j = 1; j <= N; j++) {
           for (int i = 1 + ((j + k) & 1); i <= M; i += 2) {
@@ -92,7 +98,7 @@ void lin_solve(int M, int N, int O, int b, float *x, float *x0, float a,
         }
       }
 
-#pragma omp for collapse(2) reduction(max : max_c)
+#pragma omp for collapse(2) schedule(static) reduction(max : max_c) nowait
       for (int k = 1; k <= O; k++) {
         for (int j = 1; j <= N; j++) {
           for (int i = 1 + ((j + k + 1) & 1); i <= M; i += 2) {
@@ -159,33 +165,36 @@ void diffuse(int M, int N, int O, int b, float *x, float *x0, float diff,
 // Advection step (uses velocity field to move quantities)
 void advect(int M, int N, int O, int b, float *d, float *d0, float *u, float *v,
             float *w, float dt) {
-  float dtX = dt * M, dtY = dt * N, dtZ = dt * O;
-#pragma omp parallel for collapse(3)
-  for (int k = 1; k <= O; k++) {
-    for (int j = 1; j <= N; j++) {
-      for (int i = 1; i <= M; i++) {
-        const auto index = IX(i, j, k);
-        float x = i - dtX * u[index];
-        float y = j - dtY * v[index];
-        float z = k - dtZ * w[index];
+#pragma omp parallel
+  {
+    float dtX = dt * M, dtY = dt * N, dtZ = dt * O;
+#pragma omp for collapse(3) schedule(guided)
+    for (int k = 1; k <= O; k++) {
+      for (int j = 1; j <= N; j++) {
+        for (int i = 1; i <= M; i++) {
+          const auto index = IX(i, j, k);
+          float x = i - dtX * u[index];
+          float y = j - dtY * v[index];
+          float z = k - dtZ * w[index];
 
-        std::clamp(x, 0.5f, M + 0.5f);
-        std::clamp(y, 0.5f, N + 0.5f);
-        std::clamp(z, 0.5f, O + 0.5f);
+          std::clamp(x, 0.5f, M + 0.5f);
+          std::clamp(y, 0.5f, N + 0.5f);
+          std::clamp(z, 0.5f, O + 0.5f);
 
-        int i0 = static_cast<int>(x), i1 = i0 + 1;
-        int j0 = static_cast<int>(y), j1 = j0 + 1;
-        int k0 = static_cast<int>(z), k1 = k0 + 1;
+          int i0 = static_cast<int>(x), i1 = i0 + 1;
+          int j0 = static_cast<int>(y), j1 = j0 + 1;
+          int k0 = static_cast<int>(z), k1 = k0 + 1;
 
-        float s1 = x - i0, s0 = 1 - s1;
-        float t1 = y - j0, t0 = 1 - t1;
-        float u1 = z - k0, u0 = 1 - u1;
+          float s1 = x - i0, s0 = 1 - s1;
+          float t1 = y - j0, t0 = 1 - t1;
+          float u1 = z - k0, u0 = 1 - u1;
 
-        d[index] =
-            s0 * (t0 * (u0 * d0[IX(i0, j0, k0)] + u1 * d0[IX(i0, j0, k1)]) +
-                  t1 * (u0 * d0[IX(i0, j1, k0)] + u1 * d0[IX(i0, j1, k1)])) +
-            s1 * (t0 * (u0 * d0[IX(i1, j0, k0)] + u1 * d0[IX(i1, j0, k1)]) +
-                  t1 * (u0 * d0[IX(i1, j1, k0)] + u1 * d0[IX(i1, j1, k1)]));
+          d[index] =
+              s0 * (t0 * (u0 * d0[IX(i0, j0, k0)] + u1 * d0[IX(i0, j0, k1)]) +
+                    t1 * (u0 * d0[IX(i0, j1, k0)] + u1 * d0[IX(i0, j1, k1)])) +
+              s1 * (t0 * (u0 * d0[IX(i1, j0, k0)] + u1 * d0[IX(i1, j0, k1)]) +
+                    t1 * (u0 * d0[IX(i1, j1, k0)] + u1 * d0[IX(i1, j1, k1)]));
+        }
       }
     }
   }
@@ -198,7 +207,7 @@ void project(int M, int N, int O, float *u, float *v, float *w, float *p,
              float *div) {
   const auto scale = -0.5f;
 
-#pragma omp parallel for collapse(3)
+#pragma omp parallel for collapse(3) schedule(static) firstprivate(scale)
   for (int k = 1; k <= O; k++) {
     for (int j = 1; j <= N; j++) {
       for (int i = 1; i <= M; i++) {
@@ -215,7 +224,7 @@ void project(int M, int N, int O, float *u, float *v, float *w, float *p,
   set_bnd(M, N, O, 0, p);
   lin_solve(M, N, O, 0, p, div, 1, 6);
 
-#pragma omp parallel for collapse(3)
+#pragma omp parallel for collapse(3) schedule(static) firstprivate(scale)
   for (int k = 1; k <= O; k++) {
     for (int j = 1; j <= N; j++) {
       for (int i = 1; i <= M; i++) {
