@@ -2,7 +2,6 @@
 #include <algorithm>
 #include <math.h>
 #include <omp.h>
-#include <stdio.h>
 
 #define BLOCK_SIZE 4
 
@@ -32,7 +31,7 @@ void set_bnd(int M, int N, int O, int b, float *x) {
 #pragma omp parallel
   {
     auto neg_mask = (b == 3) ? -1.0F : 1.0F;
-#pragma omp for collapse(2) schedule(static) nowait
+#pragma omp for collapse(2) schedule(static)
     for (int j = 1; j <= N; j++) {
       for (int i = 1; i <= M; i++) {
         x[IX(i, j, 0)] = neg_mask * x[IX(i, j, 1)];
@@ -41,7 +40,7 @@ void set_bnd(int M, int N, int O, int b, float *x) {
     }
 
     neg_mask = (b == 1) ? -1.0F : 1.0F;
-#pragma omp for collapse(2) schedule(static) nowait
+#pragma omp for collapse(2) schedule(static)
     for (j = 1; j <= O; j++) {
       for (i = 1; i <= N; i++) {
         x[IX(0, i, j)] = neg_mask * x[IX(1, i, j)];
@@ -177,9 +176,9 @@ void advect(int M, int N, int O, int b, float *d, float *d0, float *u, float *v,
           float y = j - dtY * v[index];
           float z = k - dtZ * w[index];
 
-          std::clamp(x, 0.5f, M + 0.5f);
-          std::clamp(y, 0.5f, N + 0.5f);
-          std::clamp(z, 0.5f, O + 0.5f);
+          x = std::clamp(x, 0.5f, M + 0.5f);
+          y = std::clamp(y, 0.5f, N + 0.5f);
+          z = std::clamp(z, 0.5f, O + 0.5f);
 
           int i0 = static_cast<int>(x), i1 = i0 + 1;
           int j0 = static_cast<int>(y), j1 = j0 + 1;
