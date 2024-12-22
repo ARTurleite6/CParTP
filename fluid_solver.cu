@@ -1,0 +1,434 @@
+#include "fluid_solver.h"
+#include "resource_manager.h"
+#include <algorithm>
+#include <cuda_runtime.h>
+#include <math.h>
+
+#define BLOCK_SIZE 4
+
+#define IX(i, j, k) ((i) + (M + 2) * (j) + (M + 2) * (N + 2) * (k))
+#define SWAP(x0, x)                                                            \
+  {                                                                            \
+    float *tmp = x0;                                                           \
+    x0 = x;                                                                    \
+    x = tmp;                                                                   \
+  }
+#define MAX(a, b) (((a) > (b)) ? (a) : (b))
+#define LINEARSOLVERTIMES 20
+
+__device__ float clamp(float val, float minVal, float maxVal) {
+  return max(min(val, maxVal), minVal);
+}
+
+// Add sources (density or velocity)
+void add_source(int M, int N, int O, float *x, float *s, float dt) {
+  int size = (M + 2) * (N + 2) * (O + 2);
+  for (int i = 0; i < size; i++) {
+    x[i] += dt * s[i];
+  }
+}
+
+// Set boundary conditions
+void set_bnd(int M, int N, int O, int b, float *x) {
+  int i, j;
+
+  auto neg_mask = (b == 3) ? -1.0F : 1.0F;
+  for (int j = 1; j <= N; j++) {
+    for (int i = 1; i <= M; i++) {
+      x[IX(i, j, 0)] = neg_mask * x[IX(i, j, 1)];
+      x[IX(i, j, O + 1)] = neg_mask * x[IX(i, j, O)];
+    }
+  }
+
+  neg_mask = (b == 1) ? -1.0F : 1.0F;
+  for (j = 1; j <= O; j++) {
+    for (i = 1; i <= N; i++) {
+      x[IX(0, i, j)] = neg_mask * x[IX(1, i, j)];
+      x[IX(M + 1, i, j)] = neg_mask * x[IX(M, i, j)];
+    }
+  }
+
+  neg_mask = (b == 2) ? -1.0F : 1.0F;
+  for (j = 1; j <= O; j++) {
+    for (i = 1; i <= M; i++) {
+      x[IX(i, 0, j)] = neg_mask * x[IX(i, 1, j)];
+      x[IX(i, N + 1, j)] = neg_mask * x[IX(i, N, j)];
+    }
+  }
+
+  // Set corners
+  x[IX(0, 0, 0)] = 0.33f * (x[IX(1, 0, 0)] + x[IX(0, 1, 0)] + x[IX(0, 0, 1)]);
+  x[IX(M + 1, 0, 0)] =
+      0.33f * (x[IX(M, 0, 0)] + x[IX(M + 1, 1, 0)] + x[IX(M + 1, 0, 1)]);
+  x[IX(0, N + 1, 0)] =
+      0.33f * (x[IX(1, N + 1, 0)] + x[IX(0, N, 0)] + x[IX(0, N + 1, 1)]);
+  x[IX(M + 1, N + 1, 0)] = 0.33f * (x[IX(M, N + 1, 0)] + x[IX(M + 1, N, 0)] +
+                                    x[IX(M + 1, N + 1, 1)]);
+}
+
+// Kernel for setting z-faces (top and bottom boundaries)
+__global__ void set_bnd_z_faces(int M, int N, int O, int b, float *x) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x + 1;
+  int j = blockIdx.y * blockDim.y + threadIdx.y + 1;
+
+  if (i <= M && j <= N) {
+    float neg_mask = (b == 3) ? -1.0f : 1.0f;
+    x[IX(i, j, 0)] = neg_mask * x[IX(i, j, 1)];
+    x[IX(i, j, O + 1)] = neg_mask * x[IX(i, j, O)];
+  }
+}
+
+// Kernel for setting x-faces (left and right boundaries)
+__global__ void set_bnd_x_faces(int M, int N, int O, int b, float *x) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x + 1;
+  int j = blockIdx.y * blockDim.y + threadIdx.y + 1;
+
+  if (i <= N && j <= O) {
+    float neg_mask = (b == 1) ? -1.0f : 1.0f;
+    x[IX(0, i, j)] = neg_mask * x[IX(1, i, j)];
+    x[IX(M + 1, i, j)] = neg_mask * x[IX(M, i, j)];
+  }
+}
+
+// Kernel for setting y-faces (front and back boundaries)
+__global__ void set_bnd_y_faces(int M, int N, int O, int b, float *x) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x + 1;
+  int j = blockIdx.y * blockDim.y + threadIdx.y + 1;
+
+  if (i <= M && j <= O) {
+    float neg_mask = (b == 2) ? -1.0f : 1.0f;
+    x[IX(i, 0, j)] = neg_mask * x[IX(i, 1, j)];
+    x[IX(i, N + 1, j)] = neg_mask * x[IX(i, N, j)];
+  }
+}
+
+// Kernel for setting corners
+__global__ void set_bnd_corners(int M, int N, int O, float *x) {
+  if (threadIdx.x == 0 && blockIdx.x == 0) {
+    x[IX(0, 0, 0)] = 0.33f * (x[IX(1, 0, 0)] + x[IX(0, 1, 0)] + x[IX(0, 0, 1)]);
+
+    x[IX(M + 1, 0, 0)] =
+        0.33f * (x[IX(M, 0, 0)] + x[IX(M + 1, 1, 0)] + x[IX(M + 1, 0, 1)]);
+
+    x[IX(0, N + 1, 0)] =
+        0.33f * (x[IX(1, N + 1, 0)] + x[IX(0, N, 0)] + x[IX(0, N + 1, 1)]);
+
+    x[IX(M + 1, N + 1, 0)] = 0.33f * (x[IX(M, N + 1, 0)] + x[IX(M + 1, N, 0)] +
+                                      x[IX(M + 1, N + 1, 1)]);
+  }
+}
+
+void set_bnd_cuda(int M, int N, int O, int b, float *x_dev) {
+  // Set up dimensions for face kernels
+  dim3 blockDim(16, 16);
+
+  // For z-faces (M x N threads needed)
+  dim3 gridDim_z((M + blockDim.x - 1) / blockDim.x,
+                 (N + blockDim.y - 1) / blockDim.y);
+  set_bnd_z_faces<<<gridDim_z, blockDim>>>(M, N, O, b, x_dev);
+
+  // For x-faces (N x O threads needed)
+  dim3 gridDim_x((N + blockDim.x - 1) / blockDim.x,
+                 (O + blockDim.y - 1) / blockDim.y);
+  set_bnd_x_faces<<<gridDim_x, blockDim>>>(M, N, O, b, x_dev);
+
+  // For y-faces (M x O threads needed)
+  dim3 gridDim_y((M + blockDim.x - 1) / blockDim.x,
+                 (O + blockDim.y - 1) / blockDim.y);
+  set_bnd_y_faces<<<gridDim_y, blockDim>>>(M, N, O, b, x_dev);
+
+  // For corners (single thread is enough)
+  set_bnd_corners<<<1, 1>>>(M, N, O, x_dev);
+}
+
+// CUDA kernel for red-black Gauss-Seidel iteration
+__global__ void lin_solve_kernel(int M, int N, int O, float *x, const float *x0,
+                                 float a, float c, int color,
+                                 float *max_change) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x + 1;
+  int j = blockIdx.y * blockDim.y + threadIdx.y + 1;
+  int k = blockIdx.z * blockDim.z + threadIdx.z + 1;
+
+  if (i <= M && j <= N && k <= O) {
+    // Check if this cell matches the current color pattern
+    if (((i + j + k) & 1) == color) {
+      float old_x = x[IX(i, j, k)];
+      float new_value =
+          (x0[IX(i, j, k)] +
+           a * (x[IX(i - 1, j, k)] + x[IX(i + 1, j, k)] + x[IX(i, j - 1, k)] +
+                x[IX(i, j + 1, k)] + x[IX(i, j, k - 1)] + x[IX(i, j, k + 1)])) /
+          c;
+
+      float change = fabsf(new_value - old_x);
+      atomicMax((int *)max_change, __float_as_int(change));
+      x[IX(i, j, k)] = new_value;
+    }
+  }
+}
+
+// Host function to manage the CUDA implementation
+void lin_solve_cuda(int M, int N, int O, int b, float *x_host, float *x0_host,
+                    float a, float c) {
+  float *max_change_dev;
+  float max_change_host;
+  const float tol = 1e-7f;
+  const int max_iterations = 20;
+  const size_t size = (M + 2) * (N + 2) * (O + 2) * sizeof(float);
+
+  auto &instance = ResourceManager::getInstance();
+  // Allocate device memory
+  cudaMalloc(&max_change_dev, sizeof(float));
+
+  // Copy data to device
+  cudaMemcpy(instance.x_dev, x_host, size, cudaMemcpyHostToDevice);
+  cudaMemcpy(instance.x0_dev, x0_host, size, cudaMemcpyHostToDevice);
+
+  // Set up grid and block dimensions
+  dim3 blockDim(8, 8, 8);
+  dim3 gridDim((M + blockDim.x - 1) / blockDim.x,
+               (N + blockDim.y - 1) / blockDim.y,
+               (O + blockDim.z - 1) / blockDim.z);
+
+  int iteration = 0;
+  do {
+    // Reset max_change for this iteration
+    max_change_host = 0.0f;
+    cudaMemcpy(max_change_dev, &max_change_host, sizeof(float),
+               cudaMemcpyHostToDevice);
+
+    // Red sweep (color = 0)
+    lin_solve_kernel<<<gridDim, blockDim>>>(
+        M, N, O, instance.x_dev, instance.x0_dev, a, c, 0, max_change_dev);
+
+    // Black sweep (color = 1)
+    lin_solve_kernel<<<gridDim, blockDim>>>(
+        M, N, O, instance.x_dev, instance.x0_dev, a, c, 1, max_change_dev);
+
+    // Handle boundary conditions
+    set_bnd_cuda(M, N, O, b, instance.x_dev);
+
+    // Copy max_change back to host to check convergence
+    cudaMemcpy(&max_change_host, max_change_dev, sizeof(float),
+               cudaMemcpyDeviceToHost);
+
+    iteration++;
+  } while (max_change_host > tol && iteration < max_iterations);
+
+  // Copy result back to host
+  cudaMemcpy(x_host, instance.x_dev, size, cudaMemcpyDeviceToHost);
+
+  // Clean up
+  cudaFree(max_change_dev);
+}
+
+#if 0
+// red-black solver with convergence check
+void lin_solve(int M, int N, int O, int b, float *x,
+               float *x0, float a, float c) {
+ 
+}
+
+#else
+
+// Linear solve for implicit methods (diffusion)
+void lin_solve(int M, int N, int O, int b, float *x, float *x0, float a,
+               float c) {
+  const float a_div_c = a / c;
+  const float inv_c = 1.0f / c;
+
+  for (int l = 0; l < LINEARSOLVERTIMES; l++) {
+    for (int kk = 1; kk <= O; kk += BLOCK_SIZE) {
+      for (int jj = 1; jj <= N; jj += BLOCK_SIZE) {
+        for (int ii = 1; ii <= M; ii += BLOCK_SIZE) {
+          for (int k = kk; k < kk + BLOCK_SIZE && k <= O; k++) {
+            for (int j = jj; j < jj + BLOCK_SIZE && j <= N; j++) {
+              for (int i = ii; i < ii + BLOCK_SIZE && i <= M; i++) {
+                const auto index = IX(i, j, k);
+                const auto result =
+                    (x0[index] * inv_c +
+                     a_div_c * (x[index - 1] + x[index + 1] +
+                                x[IX(i, j - 1, k)] + x[IX(i, j + 1, k)] +
+                                x[IX(i, j, k - 1)] + x[IX(i, j, k + 1)]));
+                x[index] = result;
+              }
+            }
+          }
+        }
+      }
+    }
+    set_bnd(M, N, O, b, x);
+  }
+}
+
+#endif
+
+// Diffusion step (uses implicit method)
+void diffuse(int M, int N, int O, int b, float *x, float *x0, float diff,
+             float dt) {
+  int max = MAX(MAX(M, N), O);
+  float a = dt * diff * max * max;
+  lin_solve_cuda(M, N, O, b, x, x0, a, 1 + 6 * a);
+}
+
+__global__ void advect_kernel(int M, int N, int O, int b, float *d, float *d0,
+                              float *u, float *v, float *w, float dt) {
+  float dtX = dt * M, dtY = dt * N, dtZ = dt * O;
+  int i = blockIdx.x * blockDim.x + threadIdx.x + 1;
+  int j = blockIdx.y * blockDim.y + threadIdx.y + 1;
+  int k = blockIdx.z * blockDim.z + threadIdx.z + 1;
+
+  if (i <= M && j <= N && k <= O) {
+    const auto index = IX(i, j, k);
+    float x = i - dtX * u[index];
+    float y = j - dtY * v[index];
+    float z = k - dtZ * w[index];
+
+    x = clamp(x, 0.5f, M + 0.5f);
+    y = clamp(y, 0.5f, N + 0.5f);
+    z = clamp(z, 0.5f, O + 0.5f);
+
+    int i0 = static_cast<int>(x), i1 = i0 + 1;
+    int j0 = static_cast<int>(y), j1 = j0 + 1;
+    int k0 = static_cast<int>(z), k1 = k0 + 1;
+
+    float s1 = x - i0, s0 = 1 - s1;
+    float t1 = y - j0, t0 = 1 - t1;
+    float u1 = z - k0, u0 = 1 - u1;
+
+    d[index] = s0 * (t0 * (u0 * d0[IX(i0, j0, k0)] + u1 * d0[IX(i0, j0, k1)]) +
+                     t1 * (u0 * d0[IX(i0, j1, k0)] + u1 * d0[IX(i0, j1, k1)])) +
+               s1 * (t0 * (u0 * d0[IX(i1, j0, k0)] + u1 * d0[IX(i1, j0, k1)]) +
+                     t1 * (u0 * d0[IX(i1, j1, k0)] + u1 * d0[IX(i1, j1, k1)]));
+  }
+}
+
+void advect_cuda(int M, int N, int O, int b, float *d, float *d0, float *u,
+                 float *v, float *w, float dt) {
+  const size_t size = (M + 2) * (N + 2) * (O + 2) * sizeof(float);
+
+  auto &instance = ResourceManager::getInstance();
+
+  // Allocate device memory
+  cudaMemcpy(instance.d_dev, d, size, cudaMemcpyHostToDevice);
+  cudaMemcpy(instance.d0_dev, d0, size, cudaMemcpyHostToDevice);
+  cudaMemcpy(instance.u_dev, u, size, cudaMemcpyHostToDevice);
+  cudaMemcpy(instance.v_dev, v, size, cudaMemcpyHostToDevice);
+  cudaMemcpy(instance.w_dev, w, size, cudaMemcpyHostToDevice);
+
+  // Set up grid and block dimensions
+  dim3 blockDim(8, 8, 8);
+  dim3 gridDim((M + blockDim.x - 1) / blockDim.x,
+               (N + blockDim.y - 1) / blockDim.y,
+               (O + blockDim.z - 1) / blockDim.z);
+  advect_kernel<<<gridDim, blockDim>>>(M, N, O, b, instance.d_dev,
+                                       instance.d0_dev, instance.u_dev,
+                                       instance.v_dev, instance.w_dev, dt);
+
+  set_bnd_cuda(M, N, O, b, instance.d_dev);
+
+  cudaMemcpy(d, instance.d_dev, size, cudaMemcpyDeviceToHost);
+}
+
+// Advection step (uses velocity field to move quantities)
+void advect(int M, int N, int O, int b, float *d, float *d0, float *u, float *v,
+            float *w, float dt) {
+  float dtX = dt * M, dtY = dt * N, dtZ = dt * O;
+  for (int k = 1; k <= O; k++) {
+    for (int j = 1; j <= N; j++) {
+      for (int i = 1; i <= M; i++) {
+        const auto index = IX(i, j, k);
+        float x = i - dtX * u[index];
+        float y = j - dtY * v[index];
+        float z = k - dtZ * w[index];
+
+        x = std::clamp(x, 0.5f, M + 0.5f);
+        y = std::clamp(y, 0.5f, N + 0.5f);
+        z = std::clamp(z, 0.5f, O + 0.5f);
+
+        int i0 = static_cast<int>(x), i1 = i0 + 1;
+        int j0 = static_cast<int>(y), j1 = j0 + 1;
+        int k0 = static_cast<int>(z), k1 = k0 + 1;
+
+        float s1 = x - i0, s0 = 1 - s1;
+        float t1 = y - j0, t0 = 1 - t1;
+        float u1 = z - k0, u0 = 1 - u1;
+
+        d[index] =
+            s0 * (t0 * (u0 * d0[IX(i0, j0, k0)] + u1 * d0[IX(i0, j0, k1)]) +
+                  t1 * (u0 * d0[IX(i0, j1, k0)] + u1 * d0[IX(i0, j1, k1)])) +
+            s1 * (t0 * (u0 * d0[IX(i1, j0, k0)] + u1 * d0[IX(i1, j0, k1)]) +
+                  t1 * (u0 * d0[IX(i1, j1, k0)] + u1 * d0[IX(i1, j1, k1)]));
+      }
+    }
+  }
+  set_bnd(M, N, O, b, d);
+}
+
+// Projection step to ensure incompressibility (make the velocity field
+// divergence-free)
+void project(int M, int N, int O, float *u, float *v, float *w, float *p,
+             float *div) {
+  const auto scale = -0.5f;
+
+  for (int k = 1; k <= O; k++) {
+    for (int j = 1; j <= N; j++) {
+      for (int i = 1; i <= M; i++) {
+        div[IX(i, j, k)] =
+            scale *
+            (u[IX(i + 1, j, k)] - u[IX(i - 1, j, k)] + v[IX(i, j + 1, k)] -
+             v[IX(i, j - 1, k)] + w[IX(i, j, k + 1)] - w[IX(i, j, k - 1)]) /
+            MAX(M, MAX(N, O));
+        p[IX(i, j, k)] = 0;
+      }
+    }
+  }
+  set_bnd(M, N, O, 0, div);
+  set_bnd(M, N, O, 0, p);
+  lin_solve_cuda(M, N, O, 0, p, div, 1, 6);
+
+  for (int k = 1; k <= O; k++) {
+    for (int j = 1; j <= N; j++) {
+      for (int i = 1; i <= M; i++) {
+        u[IX(i, j, k)] += scale * (p[IX(i + 1, j, k)] - p[IX(i - 1, j, k)]);
+        v[IX(i, j, k)] += scale * (p[IX(i, j + 1, k)] - p[IX(i, j - 1, k)]);
+        w[IX(i, j, k)] += scale * (p[IX(i, j, k + 1)] - p[IX(i, j, k - 1)]);
+      }
+    }
+  }
+
+  set_bnd(M, N, O, 1, u);
+  set_bnd(M, N, O, 2, v);
+  set_bnd(M, N, O, 3, w);
+}
+
+// Step function for density
+void dens_step(int M, int N, int O, float *x, float *x0, float *u, float *v,
+               float *w, float diff, float dt) {
+  add_source(M, N, O, x, x0, dt);
+  SWAP(x0, x);
+  diffuse(M, N, O, 0, x, x0, diff, dt);
+  SWAP(x0, x);
+  advect_cuda(M, N, O, 0, x, x0, u, v, w, dt);
+}
+
+// Step function for velocity
+void vel_step(int M, int N, int O, float *u, float *v, float *w, float *u0,
+              float *v0, float *w0, float visc, float dt) {
+  add_source(M, N, O, u, u0, dt);
+  add_source(M, N, O, v, v0, dt);
+  add_source(M, N, O, w, w0, dt);
+  SWAP(u0, u);
+  diffuse(M, N, O, 1, u, u0, visc, dt);
+  SWAP(v0, v);
+  diffuse(M, N, O, 2, v, v0, visc, dt);
+  SWAP(w0, w);
+  diffuse(M, N, O, 3, w, w0, visc, dt);
+  project(M, N, O, u, v, w, u0, v0);
+  SWAP(u0, u);
+  SWAP(v0, v);
+  SWAP(w0, w);
+  advect_cuda(M, N, O, 1, u, u0, u0, v0, w0, dt);
+  advect_cuda(M, N, O, 2, v, v0, u0, v0, w0, dt);
+  advect_cuda(M, N, O, 3, w, w0, u0, v0, w0, dt);
+  project(M, N, O, u, v, w, u0, v0);
+}

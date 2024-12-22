@@ -1,11 +1,12 @@
-CPP = g++ -Wall --std=c++20 -Ofast -ffast-math -march=native -ftree-vectorize -funroll-loops -fopenmp
-SRCS = main.cpp fluid_solver.cpp EventManager.cpp
+CPP = nvcc
+CXXFLAGS = --std=c++17 -O3 
+SRCS = main.cu fluid_solver.cu EventManager.cpp resource_manager.cu
 
 all:
-	$(CPP) $(SRCS) -o fluid_sim
+	$(CPP) $(CXXFLAGS) $(SRCS) -o fluid_sim
 
 debug:
-	$(CPP) $(SRCS) -pg -fno-omit-frame-pointer -o fluid_sim
+	$(CPP) $(CXXFLAGS) $(SRCS) -pg -fno-omit-frame-pointer -o fluid_sim
 
 profile: all
 	/usr/lib/linux-tools-5.15.0-122/perf stat -r 3 -e instructions,cycles,L1-dcache-loads,L1-dcache-load-misses,branch,branch-misses ./fluid_sim
