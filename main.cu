@@ -60,20 +60,48 @@ void free_data() {
   delete[] dens_prev;
 }
 
+__global__ void update_dens(int index, float *dens_dev, float value) {
+  if (threadIdx.x == 0 && blockIdx.x == 0) {
+    dens_dev[index] = value;
+  }
+}
+
+__global__ void update_uvw(int index, float *u_dev, float *v_dev, float *w_dev,
+                           float u_value, float v_value, float w_value) {
+  if (threadIdx.x == 0 && blockIdx.x == 0) {
+    u_dev[index] = u_value;
+    v_dev[index] = v_value;
+    w_dev[index] = w_value;
+  }
+}
+
 // Apply events (source or force) for the current timestep
-void apply_events(const std::vector<Event> &events) {
+void apply_events(const std::vector<Event> &events, ResourceManager &rm) {
+  int i = M / 2, j = N / 2, k = O / 2;
+  const auto index = IX(i, j, k);
+  bool changed_dens = false;
+  bool changed_uvw = false;
   for (const auto &event : events) {
     if (event.type == ADD_SOURCE) {
       // Apply density source at the center of the grid
-      int i = M / 2, j = N / 2, k = O / 2;
-      dens[IX(i, j, k)] = event.density;
+      dens[index] = event.density;
+      changed_dens = true;
     } else if (event.type == APPLY_FORCE) {
       // Apply forces based on the event's vector (fx, fy, fz)
-      int i = M / 2, j = N / 2, k = O / 2;
-      u[IX(i, j, k)] = event.force.x;
-      v[IX(i, j, k)] = event.force.y;
-      w[IX(i, j, k)] = event.force.z;
+      u[index] = event.force.x;
+      v[index] = event.force.y;
+      w[index] = event.force.z;
+      changed_uvw = true;
     }
+  }
+
+  if (changed_dens) {
+    update_dens<<<1, 1>>>(index, rm.d_dev, dens[index]);
+  }
+
+  if (changed_uvw) {
+    update_uvw<<<1, 1>>>(index, rm.u_dev, rm.v_dev, rm.w_dev, u[index],
+                         v[index], w[index]);
   }
 }
 
@@ -87,17 +115,6 @@ float sum_density() {
   return total_density;
 }
 
-void copyEverything(ResourceManager &instance) {
-  cudaMemcpy(instance.u_dev, u, sizeof(float) * instance.getSize(),
-             cudaMemcpyHostToDevice);
-  cudaMemcpy(instance.v_dev, v, sizeof(float) * instance.getSize(),
-             cudaMemcpyHostToDevice);
-  cudaMemcpy(instance.w_dev, w, sizeof(float) * instance.getSize(),
-             cudaMemcpyHostToDevice);
-  cudaMemcpy(instance.d_dev, dens, sizeof(float) * instance.getSize(),
-             cudaMemcpyHostToDevice);
-}
-
 // Simulation loop
 void simulate(EventManager &eventManager, int timesteps) {
   ResourceManager &instance = ResourceManager::getInstance();
@@ -106,25 +123,16 @@ void simulate(EventManager &eventManager, int timesteps) {
     // Get the events for the current timestep
     std::vector<Event> events = eventManager.get_events_at_timestamp(t);
 
-    // Apply events to the simulation
-    apply_events(events);
-    copyEverything(instance);
+    apply_events(events, instance);
 
     // Perform the simulation steps
     vel_step_cuda(M, N, O, instance.u_dev, instance.v_dev, instance.w_dev,
                   instance.u0_dev, instance.v0_dev, instance.w0_dev, visc, dt);
     dens_step_cuda(M, N, O, instance.d_dev, instance.d0_dev, instance.u_dev,
                    instance.v_dev, instance.w_dev, diff, dt);
-
-    cudaMemcpy(dens, instance.d_dev, sizeof(float) * instance.getSize(),
-               cudaMemcpyDeviceToHost);
-    cudaMemcpy(u, instance.u_dev, sizeof(float) * instance.getSize(),
-               cudaMemcpyDeviceToHost);
-    cudaMemcpy(v, instance.v_dev, sizeof(float) * instance.getSize(),
-               cudaMemcpyDeviceToHost);
-    cudaMemcpy(w, instance.w_dev, sizeof(float) * instance.getSize(),
-               cudaMemcpyDeviceToHost);
   }
+  cudaMemcpy(dens, instance.d_dev, sizeof(float) * instance.getSize(),
+             cudaMemcpyDeviceToHost);
 }
 
 int main() {
