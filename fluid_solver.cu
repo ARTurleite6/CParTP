@@ -20,6 +20,34 @@ __device__ float clamp(float val, float minVal, float maxVal) {
   return max(min(val, maxVal), minVal);
 }
 
+__global__ void add_source_kernel(int M, int N, int O, float *x, float *s,
+                                  float dt) {
+  // Calculate the 1D index of the current thread
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+  // Total number of elements in the array
+  int size = (M + 2) * (N + 2) * (O + 2);
+
+  // Perform the operation if the thread index is within bounds
+  if (idx < size) {
+    x[idx] += dt * s[idx];
+  }
+}
+
+// Add sources (density or velocity)
+void add_source_cuda(int M, int N, int O, float *x_dev, float *s_dev,
+                     float dt) {
+  int size = (M + 2) * (N + 2) * (O + 2);
+
+  // Configure block and grid sizes
+  int threadsPerBlock = 256;
+  int blocksPerGrid = (size + threadsPerBlock - 1) / threadsPerBlock;
+
+  // Launch the kernel
+  add_source_kernel<<<blocksPerGrid, threadsPerBlock>>>(M, N, O, x_dev, s_dev,
+                                                        dt);
+}
+
 // Add sources (density or velocity)
 void add_source(int M, int N, int O, float *x, float *s, float dt) {
   int size = (M + 2) * (N + 2) * (O + 2);
@@ -167,21 +195,13 @@ __global__ void lin_solve_kernel(int M, int N, int O, float *x, const float *x0,
 }
 
 // Host function to manage the CUDA implementation
-void lin_solve_cuda(int M, int N, int O, int b, float *x_host, float *x0_host,
-                    float a, float c) {
-  float *max_change_dev;
+void lin_solve_cuda(int M, int N, int O, int b, float *x, float *x0, float a,
+                    float c) {
   float max_change_host;
   const float tol = 1e-7f;
   const int max_iterations = 20;
-  const size_t size = (M + 2) * (N + 2) * (O + 2) * sizeof(float);
 
   auto &instance = ResourceManager::getInstance();
-  // Allocate device memory
-  cudaMalloc(&max_change_dev, sizeof(float));
-
-  // Copy data to device
-  cudaMemcpy(instance.x_dev, x_host, size, cudaMemcpyHostToDevice);
-  cudaMemcpy(instance.x0_dev, x0_host, size, cudaMemcpyHostToDevice);
 
   // Set up grid and block dimensions
   dim3 blockDim(8, 8, 8);
@@ -193,32 +213,26 @@ void lin_solve_cuda(int M, int N, int O, int b, float *x_host, float *x0_host,
   do {
     // Reset max_change for this iteration
     max_change_host = 0.0f;
-    cudaMemcpy(max_change_dev, &max_change_host, sizeof(float),
+    cudaMemcpy(instance.max_change, &max_change_host, sizeof(float),
                cudaMemcpyHostToDevice);
 
     // Red sweep (color = 0)
-    lin_solve_kernel<<<gridDim, blockDim>>>(
-        M, N, O, instance.x_dev, instance.x0_dev, a, c, 0, max_change_dev);
+    lin_solve_kernel<<<gridDim, blockDim>>>(M, N, O, x, x0, a, c, 0,
+                                            instance.max_change);
 
     // Black sweep (color = 1)
-    lin_solve_kernel<<<gridDim, blockDim>>>(
-        M, N, O, instance.x_dev, instance.x0_dev, a, c, 1, max_change_dev);
+    lin_solve_kernel<<<gridDim, blockDim>>>(M, N, O, x, x0, a, c, 1,
+                                            instance.max_change);
 
     // Handle boundary conditions
-    set_bnd_cuda(M, N, O, b, instance.x_dev);
+    set_bnd_cuda(M, N, O, b, x);
 
     // Copy max_change back to host to check convergence
-    cudaMemcpy(&max_change_host, max_change_dev, sizeof(float),
+    cudaMemcpy(&max_change_host, instance.max_change, sizeof(float),
                cudaMemcpyDeviceToHost);
 
     iteration++;
   } while (max_change_host > tol && iteration < max_iterations);
-
-  // Copy result back to host
-  cudaMemcpy(x_host, instance.x_dev, size, cudaMemcpyDeviceToHost);
-
-  // Clean up
-  cudaFree(max_change_dev);
 }
 
 #if 0
@@ -263,11 +277,19 @@ void lin_solve(int M, int N, int O, int b, float *x, float *x0, float a,
 #endif
 
 // Diffusion step (uses implicit method)
+void diffuse_cuda(int M, int N, int O, int b, float *x, float *x0, float diff,
+                  float dt) {
+  int max = MAX(MAX(M, N), O);
+  float a = dt * diff * max * max;
+  lin_solve_cuda(M, N, O, b, x, x0, a, 1 + 6 * a);
+}
+
+// Diffusion step (uses implicit method)
 void diffuse(int M, int N, int O, int b, float *x, float *x0, float diff,
              float dt) {
   int max = MAX(MAX(M, N), O);
   float a = dt * diff * max * max;
-  lin_solve_cuda(M, N, O, b, x, x0, a, 1 + 6 * a);
+  lin_solve(M, N, O, b, x, x0, a, 1 + 6 * a);
 }
 
 __global__ void advect_kernel(int M, int N, int O, int b, float *d, float *d0,
@@ -304,29 +326,14 @@ __global__ void advect_kernel(int M, int N, int O, int b, float *d, float *d0,
 
 void advect_cuda(int M, int N, int O, int b, float *d, float *d0, float *u,
                  float *v, float *w, float dt) {
-  const size_t size = (M + 2) * (N + 2) * (O + 2) * sizeof(float);
-
-  auto &instance = ResourceManager::getInstance();
-
-  // Allocate device memory
-  cudaMemcpy(instance.d_dev, d, size, cudaMemcpyHostToDevice);
-  cudaMemcpy(instance.d0_dev, d0, size, cudaMemcpyHostToDevice);
-  cudaMemcpy(instance.u_dev, u, size, cudaMemcpyHostToDevice);
-  cudaMemcpy(instance.v_dev, v, size, cudaMemcpyHostToDevice);
-  cudaMemcpy(instance.w_dev, w, size, cudaMemcpyHostToDevice);
-
   // Set up grid and block dimensions
   dim3 blockDim(8, 8, 8);
   dim3 gridDim((M + blockDim.x - 1) / blockDim.x,
                (N + blockDim.y - 1) / blockDim.y,
                (O + blockDim.z - 1) / blockDim.z);
-  advect_kernel<<<gridDim, blockDim>>>(M, N, O, b, instance.d_dev,
-                                       instance.d0_dev, instance.u_dev,
-                                       instance.v_dev, instance.w_dev, dt);
+  advect_kernel<<<gridDim, blockDim>>>(M, N, O, b, d, d0, u, v, w, dt);
 
-  set_bnd_cuda(M, N, O, b, instance.d_dev);
-
-  cudaMemcpy(d, instance.d_dev, size, cudaMemcpyDeviceToHost);
+  set_bnd_cuda(M, N, O, b, d);
 }
 
 // Advection step (uses velocity field to move quantities)
@@ -364,8 +371,39 @@ void advect(int M, int N, int O, int b, float *d, float *d0, float *u, float *v,
   set_bnd(M, N, O, b, d);
 }
 
-// Projection step to ensure incompressibility (make the velocity field
-// divergence-free)
+__global__ void compute_divergence_kernel(int M, int N, int O, const float *u,
+                                          const float *v, const float *w,
+                                          float *div, float *p) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  int j = blockIdx.y * blockDim.y + threadIdx.y;
+  int k = blockIdx.z * blockDim.z + threadIdx.z;
+
+  if (i >= 1 && i <= M && j >= 1 && j <= N && k >= 1 && k <= O) {
+    int idx = IX(i, j, k);
+    div[idx] = -0.5f *
+               ((u[IX(i + 1, j, k)] - u[IX(i - 1, j, k)]) +
+                (v[IX(i, j + 1, k)] - v[IX(i, j - 1, k)]) +
+                (w[IX(i, j, k + 1)] - w[IX(i, j, k - 1)])) /
+               MAX(M, MAX(N, O));
+
+    p[idx] = 0.0f; // Initialize pressure to zero
+  }
+}
+
+__global__ void update_velocity_kernel(int M, int N, int O, float *u, float *v,
+                                       float *w, const float *p) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  int j = blockIdx.y * blockDim.y + threadIdx.y;
+  int k = blockIdx.z * blockDim.z + threadIdx.z;
+
+  if (i >= 1 && i <= M && j >= 1 && j <= N && k >= 1 && k <= O) {
+    int idx = IX(i, j, k);
+    u[idx] += -0.5f * (p[IX(i + 1, j, k)] - p[IX(i - 1, j, k)]);
+    v[idx] += -0.5f * (p[IX(i, j + 1, k)] - p[IX(i, j - 1, k)]);
+    w[idx] += -0.5f * (p[IX(i, j, k + 1)] - p[IX(i, j, k - 1)]);
+  }
+}
+
 void project(int M, int N, int O, float *u, float *v, float *w, float *p,
              float *div) {
   const auto scale = -0.5f;
@@ -384,7 +422,7 @@ void project(int M, int N, int O, float *u, float *v, float *w, float *p,
   }
   set_bnd(M, N, O, 0, div);
   set_bnd(M, N, O, 0, p);
-  lin_solve_cuda(M, N, O, 0, p, div, 1, 6);
+  lin_solve(M, N, O, 0, p, div, 1, 6);
 
   for (int k = 1; k <= O; k++) {
     for (int j = 1; j <= N; j++) {
@@ -401,6 +439,39 @@ void project(int M, int N, int O, float *u, float *v, float *w, float *p,
   set_bnd(M, N, O, 3, w);
 }
 
+// Projection step to ensure incompressibility (make the velocity field
+// divergence-free)
+void project_cuda(int M, int N, int O, float *u, float *v, float *w, float *p,
+                  float *div) {
+  dim3 blockDim(8, 8, 8);
+  dim3 gridDim((M + blockDim.x - 1) / blockDim.x,
+               (N + blockDim.y - 1) / blockDim.y,
+               (O + blockDim.z) / blockDim.z);
+
+  // Step 1: Compute divergence and initialize pressure to zero
+  compute_divergence_kernel<<<gridDim, blockDim>>>(M, N, O, u, v, w, div, p);
+
+  set_bnd_cuda(M, N, O, 0, div);
+  set_bnd_cuda(M, N, O, 0, p);
+  lin_solve_cuda(M, N, O, 0, p, div, 1, 6);
+
+  update_velocity_kernel<<<gridDim, blockDim>>>(M, N, O, u, v, w, p);
+
+  set_bnd_cuda(M, N, O, 1, u);
+  set_bnd_cuda(M, N, O, 2, v);
+  set_bnd_cuda(M, N, O, 3, w);
+}
+
+void dens_step_cuda(int M, int N, int O, float *x, float *x0, float *u,
+                    float *v, float *w, float diff, float dt) {
+  add_source_cuda(M, N, O, x, x0, dt);
+  SWAP(x0, x);
+  diffuse_cuda(M, N, O, 0, x, x0, diff, dt);
+  SWAP(x, x0);
+
+  advect_cuda(M, N, O, 0, x, x0, u, v, w, dt);
+}
+
 // Step function for density
 void dens_step(int M, int N, int O, float *x, float *x0, float *u, float *v,
                float *w, float diff, float dt) {
@@ -408,7 +479,29 @@ void dens_step(int M, int N, int O, float *x, float *x0, float *u, float *v,
   SWAP(x0, x);
   diffuse(M, N, O, 0, x, x0, diff, dt);
   SWAP(x0, x);
-  advect_cuda(M, N, O, 0, x, x0, u, v, w, dt);
+  advect(M, N, O, 0, x, x0, u, v, w, dt);
+}
+
+// Step function for velocity
+void vel_step_cuda(int M, int N, int O, float *u, float *v, float *w, float *u0,
+                   float *v0, float *w0, float visc, float dt) {
+  add_source_cuda(M, N, O, u, u0, dt);
+  add_source_cuda(M, N, O, v, v0, dt);
+  add_source_cuda(M, N, O, w, w0, dt);
+  SWAP(u0, u);
+  diffuse_cuda(M, N, O, 1, u, u0, visc, dt);
+  SWAP(v0, v);
+  diffuse_cuda(M, N, O, 2, v, v0, visc, dt);
+  SWAP(w0, w);
+  diffuse_cuda(M, N, O, 3, w, w0, visc, dt);
+  project_cuda(M, N, O, u, v, w, u0, v0);
+  SWAP(u0, u);
+  SWAP(v0, v);
+  SWAP(w0, w);
+  advect_cuda(M, N, O, 1, u, u0, u0, v0, w0, dt);
+  advect_cuda(M, N, O, 2, v, v0, u0, v0, w0, dt);
+  advect_cuda(M, N, O, 3, w, w0, u0, v0, w0, dt);
+  project_cuda(M, N, O, u, v, w, u0, v0);
 }
 
 // Step function for velocity
@@ -427,8 +520,8 @@ void vel_step(int M, int N, int O, float *u, float *v, float *w, float *u0,
   SWAP(u0, u);
   SWAP(v0, v);
   SWAP(w0, w);
-  advect_cuda(M, N, O, 1, u, u0, u0, v0, w0, dt);
-  advect_cuda(M, N, O, 2, v, v0, u0, v0, w0, dt);
-  advect_cuda(M, N, O, 3, w, w0, u0, v0, w0, dt);
+  advect(M, N, O, 1, u, u0, u0, v0, w0, dt);
+  advect(M, N, O, 2, v, v0, u0, v0, w0, dt);
+  advect(M, N, O, 3, w, w0, u0, v0, w0, dt);
   project(M, N, O, u, v, w, u0, v0);
 }

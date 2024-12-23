@@ -87,24 +87,50 @@ float sum_density() {
   return total_density;
 }
 
+void copyEverything(ResourceManager &instance) {
+  cudaMemcpy(instance.u_dev, u, sizeof(float) * instance.getSize(),
+             cudaMemcpyHostToDevice);
+  cudaMemcpy(instance.v_dev, v, sizeof(float) * instance.getSize(),
+             cudaMemcpyHostToDevice);
+  cudaMemcpy(instance.w_dev, w, sizeof(float) * instance.getSize(),
+             cudaMemcpyHostToDevice);
+  cudaMemcpy(instance.d_dev, dens, sizeof(float) * instance.getSize(),
+             cudaMemcpyHostToDevice);
+}
+
 // Simulation loop
 void simulate(EventManager &eventManager, int timesteps) {
   ResourceManager &instance = ResourceManager::getInstance();
+
   for (int t = 0; t < timesteps; t++) {
     // Get the events for the current timestep
     std::vector<Event> events = eventManager.get_events_at_timestamp(t);
 
     // Apply events to the simulation
     apply_events(events);
+    copyEverything(instance);
 
     // Perform the simulation steps
-    vel_step(M, N, O, u, v, w, u_prev, v_prev, w_prev, visc, dt);
-    dens_step(M, N, O, dens, dens_prev, u, v, w, diff, dt);
+    vel_step_cuda(M, N, O, instance.u_dev, instance.v_dev, instance.w_dev,
+                  instance.u0_dev, instance.v0_dev, instance.w0_dev, visc, dt);
+    dens_step_cuda(M, N, O, instance.d_dev, instance.d0_dev, instance.u_dev,
+                   instance.v_dev, instance.w_dev, diff, dt);
+
+    cudaMemcpy(dens, instance.d_dev, sizeof(float) * instance.getSize(),
+               cudaMemcpyDeviceToHost);
+    cudaMemcpy(u, instance.u_dev, sizeof(float) * instance.getSize(),
+               cudaMemcpyDeviceToHost);
+    cudaMemcpy(v, instance.v_dev, sizeof(float) * instance.getSize(),
+               cudaMemcpyDeviceToHost);
+    cudaMemcpy(w, instance.w_dev, sizeof(float) * instance.getSize(),
+               cudaMemcpyDeviceToHost);
   }
 }
 
 int main() {
   cudaSetDevice(0);
+
+  cudaProfilerStart();
   // Initialize EventManager
   EventManager eventManager;
   eventManager.read_events("events.txt");
@@ -117,12 +143,8 @@ int main() {
     return -1;
   clear_data();
 
-  cudaProfilerStart();
-
   // Run simulation with events
   simulate(eventManager, timesteps);
-
-  cudaProfilerStop();
 
   // Print total density at the end of simulation
   float total_density = sum_density();
@@ -136,6 +158,8 @@ int main() {
   if (err != cudaSuccess) {
     printf("Cuda Error: %s\n", cudaGetErrorString(err));
   }
+
+  cudaProfilerStop();
 
   return 0;
 }

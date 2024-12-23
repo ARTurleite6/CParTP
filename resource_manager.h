@@ -8,8 +8,8 @@ constexpr int SIZE{84};
 
 class ResourceManager {
 public:
-  float *x_dev, *x0_dev;
-  float *d_dev, *d0_dev, *u_dev, *v_dev, *w_dev;
+  float *d_dev, *d0_dev, *u_dev, *u0_dev, *v_dev, *v0_dev, *w_dev, *w0_dev;
+  float *max_change;
 
 public:
   static ResourceManager &getInstance() {
