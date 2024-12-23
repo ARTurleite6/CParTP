@@ -5,8 +5,8 @@ SRCS = main.cu fluid_solver.cu EventManager.cpp resource_manager.cu
 all:
 	$(CPP) $(CXXFLAGS) $(SRCS) -o fluid_sim
 
-debug:
-	$(CPP) $(CXXFLAGS) $(SRCS) -pg -fno-omit-frame-pointer -o fluid_sim
+run:
+	sbatch ./run.sh
 
 profile: all
 	/usr/lib/linux-tools-5.15.0-122/perf stat -r 3 -e instructions,cycles,L1-dcache-loads,L1-dcache-load-misses,branch,branch-misses ./fluid_sim

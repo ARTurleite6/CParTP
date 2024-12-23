@@ -2,7 +2,7 @@
 #define RESOURCE_MANAGER_H
 
 #include <iostream>
-constexpr int SIZE{84};
+constexpr int SIZE{168};
 
 #include <cstddef>
 
