@@ -146,6 +146,54 @@ __global__ void set_bnd_corners(int M, int N, int O, float *x) {
   }
 }
 
+__global__ void set_bnd_kernel(int M, int N, int O, int b, float *x) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x + 1;
+  int j = blockIdx.y * blockDim.y + threadIdx.y + 1;
+  int k = blockIdx.z * blockDim.z + threadIdx.z + 1;
+
+  if (i <= M && j <= N && k <= O) {
+    // Set z-faces (top and bottom boundaries)
+    if (k == 0) {
+      float neg_mask = (b == 3) ? -1.0f : 1.0f;
+      x[IX(i, j, 0)] = neg_mask * x[IX(i, j, 1)];
+    } else if (k == O + 1) {
+      float neg_mask = (b == 3) ? -1.0f : 1.0f;
+      x[IX(i, j, O + 1)] = neg_mask * x[IX(i, j, O)];
+    }
+    // Set x-faces (left and right boundaries)
+    else if (i == 0) {
+      float neg_mask = (b == 1) ? -1.0f : 1.0f;
+      x[IX(0, j, k)] = neg_mask * x[IX(1, j, k)];
+    } else if (i == M + 1) {
+      float neg_mask = (b == 1) ? -1.0f : 1.0f;
+      x[IX(M + 1, j, k)] = neg_mask * x[IX(M, j, k)];
+    }
+    // Set y-faces (front and back boundaries)
+    else if (j == 0) {
+      float neg_mask = (b == 2) ? -1.0f : 1.0f;
+      x[IX(i, 0, k)] = neg_mask * x[IX(i, 1, k)];
+    } else if (j == N + 1) {
+      float neg_mask = (b == 2) ? -1.0f : 1.0f;
+      x[IX(i, N + 1, k)] = neg_mask * x[IX(i, N, k)];
+    }
+    // Set corners
+    else if (i == 1 && j == 1 && k == 1) {
+      x[IX(0, 0, 0)] =
+          0.33f * (x[IX(1, 0, 0)] + x[IX(0, 1, 0)] + x[IX(0, 0, 1)]);
+    } else if (i == M && j == 1 && k == 1) {
+      x[IX(M + 1, 0, 0)] =
+          0.33f * (x[IX(M, 0, 0)] + x[IX(M + 1, 1, 0)] + x[IX(M + 1, 0, 1)]);
+    } else if (i == 1 && j == N && k == 1) {
+      x[IX(0, N + 1, 0)] =
+          0.33f * (x[IX(1, N + 1, 0)] + x[IX(0, N, 0)] + x[IX(0, N + 1, 1)]);
+    } else if (i == M && j == N && k == 1) {
+      x[IX(M + 1, N + 1, 0)] =
+          0.33f *
+          (x[IX(M, N + 1, 0)] + x[IX(M + 1, N, 0)] + x[IX(M + 1, N + 1, 1)]);
+    }
+  }
+}
+
 void set_bnd_cuda(int M, int N, int O, int b, float *x_dev) {
   // Set up dimensions for face kernels
   dim3 blockDim(16, 16);
@@ -173,9 +221,13 @@ void set_bnd_cuda(int M, int N, int O, int b, float *x_dev) {
 __global__ void lin_solve_kernel(int M, int N, int O, float *x, const float *x0,
                                  float a, float c, int color,
                                  float *max_change) {
+  __shared__ float block_max[512];
+  int tid = threadIdx.x + threadIdx.y * blockDim.x +
+            threadIdx.z * blockDim.x * blockDim.y;
   int i = blockIdx.x * blockDim.x + threadIdx.x + 1;
   int j = blockIdx.y * blockDim.y + threadIdx.y + 1;
   int k = blockIdx.z * blockDim.z + threadIdx.z + 1;
+  float local_max = 0.0;
 
   if (i <= M && j <= N && k <= O) {
     // Check if this cell matches the current color pattern
@@ -188,18 +240,44 @@ __global__ void lin_solve_kernel(int M, int N, int O, float *x, const float *x0,
           c;
 
       float change = fabsf(new_value - old_x);
-      atomicMax((int *)max_change, __float_as_int(change));
+      local_max = fmaxf(local_max, change);
       x[IX(i, j, k)] = new_value;
     }
+  }
+
+  block_max[tid] = local_max;
+  __syncthreads();
+
+  // Perform block-wise reduction in shared memory
+  for (int stride = blockDim.x * blockDim.y * blockDim.z / 2; stride > 0;
+       stride /= 2) {
+    if (tid < stride) {
+      block_max[tid] = fmaxf(block_max[tid], block_max[tid + stride]);
+    }
+    __syncthreads();
+  }
+
+  // Write block maximum to global memory
+  if (tid == 0) {
+    atomicMax((int *)max_change, __float_as_int(block_max[0]));
+  }
+}
+
+__global__ void check_convergence_kernel(float *max_change, float tolerance,
+                                         bool *converged) {
+  if (threadIdx.x == 0 && blockIdx.x == 0) {
+    *converged = (*max_change < tolerance);
   }
 }
 
 // Host function to manage the CUDA implementation
 void lin_solve_cuda(int M, int N, int O, int b, float *x, float *x0, float a,
                     float c) {
-  float max_change_host;
-  const float tol = 1e-7f;
+  float tol = 1e-7;
   const int max_iterations = 20;
+  bool *converged;
+  bool converged_host = false;
+  cudaMalloc(&converged, sizeof(bool));
 
   auto &instance = ResourceManager::getInstance();
 
@@ -212,9 +290,7 @@ void lin_solve_cuda(int M, int N, int O, int b, float *x, float *x0, float a,
   int iteration = 0;
   do {
     // Reset max_change for this iteration
-    max_change_host = 0.0f;
-    cudaMemcpy(instance.max_change, &max_change_host, sizeof(float),
-               cudaMemcpyHostToDevice);
+    cudaMemset(instance.max_change, 0, sizeof(float));
 
     // Red sweep (color = 0)
     lin_solve_kernel<<<gridDim, blockDim>>>(M, N, O, x, x0, a, c, 0,
@@ -224,15 +300,17 @@ void lin_solve_cuda(int M, int N, int O, int b, float *x, float *x0, float a,
     lin_solve_kernel<<<gridDim, blockDim>>>(M, N, O, x, x0, a, c, 1,
                                             instance.max_change);
 
+    check_convergence_kernel<<<1, 1>>>(instance.max_change, tol, converged);
+
     // Handle boundary conditions
     set_bnd_cuda(M, N, O, b, x);
 
     // Copy max_change back to host to check convergence
-    cudaMemcpy(&max_change_host, instance.max_change, sizeof(float),
+    cudaMemcpy(&converged_host, converged, sizeof(bool),
                cudaMemcpyDeviceToHost);
 
     iteration++;
-  } while (max_change_host > tol && iteration < max_iterations);
+  } while (!converged_host && iteration < max_iterations);
 }
 
 #if 0
