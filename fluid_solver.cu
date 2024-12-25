@@ -146,54 +146,6 @@ __global__ void set_bnd_corners(int M, int N, int O, float *x) {
   }
 }
 
-__global__ void set_bnd_kernel(int M, int N, int O, int b, float *x) {
-  int i = blockIdx.x * blockDim.x + threadIdx.x + 1;
-  int j = blockIdx.y * blockDim.y + threadIdx.y + 1;
-  int k = blockIdx.z * blockDim.z + threadIdx.z + 1;
-
-  if (i <= M && j <= N && k <= O) {
-    // Set z-faces (top and bottom boundaries)
-    if (k == 0) {
-      float neg_mask = (b == 3) ? -1.0f : 1.0f;
-      x[IX(i, j, 0)] = neg_mask * x[IX(i, j, 1)];
-    } else if (k == O + 1) {
-      float neg_mask = (b == 3) ? -1.0f : 1.0f;
-      x[IX(i, j, O + 1)] = neg_mask * x[IX(i, j, O)];
-    }
-    // Set x-faces (left and right boundaries)
-    else if (i == 0) {
-      float neg_mask = (b == 1) ? -1.0f : 1.0f;
-      x[IX(0, j, k)] = neg_mask * x[IX(1, j, k)];
-    } else if (i == M + 1) {
-      float neg_mask = (b == 1) ? -1.0f : 1.0f;
-      x[IX(M + 1, j, k)] = neg_mask * x[IX(M, j, k)];
-    }
-    // Set y-faces (front and back boundaries)
-    else if (j == 0) {
-      float neg_mask = (b == 2) ? -1.0f : 1.0f;
-      x[IX(i, 0, k)] = neg_mask * x[IX(i, 1, k)];
-    } else if (j == N + 1) {
-      float neg_mask = (b == 2) ? -1.0f : 1.0f;
-      x[IX(i, N + 1, k)] = neg_mask * x[IX(i, N, k)];
-    }
-    // Set corners
-    else if (i == 1 && j == 1 && k == 1) {
-      x[IX(0, 0, 0)] =
-          0.33f * (x[IX(1, 0, 0)] + x[IX(0, 1, 0)] + x[IX(0, 0, 1)]);
-    } else if (i == M && j == 1 && k == 1) {
-      x[IX(M + 1, 0, 0)] =
-          0.33f * (x[IX(M, 0, 0)] + x[IX(M + 1, 1, 0)] + x[IX(M + 1, 0, 1)]);
-    } else if (i == 1 && j == N && k == 1) {
-      x[IX(0, N + 1, 0)] =
-          0.33f * (x[IX(1, N + 1, 0)] + x[IX(0, N, 0)] + x[IX(0, N + 1, 1)]);
-    } else if (i == M && j == N && k == 1) {
-      x[IX(M + 1, N + 1, 0)] =
-          0.33f *
-          (x[IX(M, N + 1, 0)] + x[IX(M + 1, N, 0)] + x[IX(M + 1, N + 1, 1)]);
-    }
-  }
-}
-
 void set_bnd_cuda(int M, int N, int O, int b, float *x_dev) {
   // Set up dimensions for face kernels
   dim3 blockDim(16, 16);
@@ -217,38 +169,48 @@ void set_bnd_cuda(int M, int N, int O, int b, float *x_dev) {
   set_bnd_corners<<<1, 1>>>(M, N, O, x_dev);
 }
 
-// CUDA kernel for red-black Gauss-Seidel iteration
-__global__ void lin_solve_kernel(int M, int N, int O, float *x, const float *x0,
-                                 float a, float c, int color,
-                                 float *max_change) {
+__global__ void lin_solve_kernel_optimized(int M, int N, int O, float *x,
+                                           const float *x0, float a, float c,
+                                           int color, float *max_change) {
   __shared__ float block_max[512];
   int tid = threadIdx.x + threadIdx.y * blockDim.x +
             threadIdx.z * blockDim.x * blockDim.y;
-  int i = blockIdx.x * blockDim.x + threadIdx.x + 1;
-  int j = blockIdx.y * blockDim.y + threadIdx.y + 1;
-  int k = blockIdx.z * blockDim.z + threadIdx.z + 1;
-  float local_max = 0.0;
 
-  if (i <= M && j <= N && k <= O) {
-    // Check if this cell matches the current color pattern
-    if (((i + j + k) & 1) == color) {
-      float old_x = x[IX(i, j, k)];
-      float new_value =
-          (x0[IX(i, j, k)] +
-           a * (x[IX(i - 1, j, k)] + x[IX(i + 1, j, k)] + x[IX(i, j - 1, k)] +
-                x[IX(i, j + 1, k)] + x[IX(i, j, k - 1)] + x[IX(i, j, k + 1)])) /
-          c;
+  // Each thread processes a 2x2x2 block of elements
+  int base_i = (blockIdx.x * blockDim.x + threadIdx.x) * 2 + 1;
+  int base_j = (blockIdx.y * blockDim.y + threadIdx.y) * 2 + 1;
+  int base_k = (blockIdx.z * blockDim.z + threadIdx.z) * 2 + 1;
 
-      float change = fabsf(new_value - old_x);
-      local_max = fmaxf(local_max, change);
-      x[IX(i, j, k)] = new_value;
+  float local_max = 0.0f;
+
+  // Process 8 elements (2x2x2 block)
+  for (int di = 0; di < 2; di++) {
+    for (int dj = 0; dj < 2; dj++) {
+      for (int dk = 0; dk < 2; dk++) {
+        int i = base_i + di;
+        int j = base_j + dj;
+        int k = base_k + dk;
+
+        if (i <= M && j <= N && k <= O && ((i + j + k) & 1) == color) {
+          // Check if this cell matches the current color pattern
+          float old_x = x[IX(i, j, k)];
+          float new_value = (x0[IX(i, j, k)] +
+                             a * (x[IX(i - 1, j, k)] + x[IX(i + 1, j, k)] +
+                                  x[IX(i, j - 1, k)] + x[IX(i, j + 1, k)] +
+                                  x[IX(i, j, k - 1)] + x[IX(i, j, k + 1)])) /
+                            c;
+          float change = fabsf(new_value - old_x);
+          local_max = fmaxf(local_max, change);
+          x[IX(i, j, k)] = new_value;
+        }
+      }
     }
   }
 
+  // Reduction remains the same
   block_max[tid] = local_max;
   __syncthreads();
 
-  // Perform block-wise reduction in shared memory
   for (int stride = blockDim.x * blockDim.y * blockDim.z / 2; stride > 0;
        stride /= 2) {
     if (tid < stride) {
@@ -257,7 +219,6 @@ __global__ void lin_solve_kernel(int M, int N, int O, float *x, const float *x0,
     __syncthreads();
   }
 
-  // Write block maximum to global memory
   if (tid == 0) {
     atomicMax((int *)max_change, __float_as_int(block_max[0]));
   }
@@ -283,31 +244,32 @@ void lin_solve_cuda(int M, int N, int O, int b, float *x, float *x0, float a,
 
   // Set up grid and block dimensions
   dim3 blockDim(8, 8, 8);
-  dim3 gridDim((M + blockDim.x - 1) / blockDim.x,
-               (N + blockDim.y - 1) / blockDim.y,
-               (O + blockDim.z - 1) / blockDim.z);
+  dim3 gridDim((M / 2 + blockDim.x - 1) / blockDim.x,
+               (N / 2 + blockDim.y - 1) / blockDim.y,
+               (O / 2 + blockDim.z - 1) / blockDim.z);
 
   int iteration = 0;
   do {
     // Reset max_change for this iteration
     cudaMemset(instance.max_change, 0, sizeof(float));
 
-    // Red sweep (color = 0)
-    lin_solve_kernel<<<gridDim, blockDim>>>(M, N, O, x, x0, a, c, 0,
-                                            instance.max_change);
+    // Red sweep (convprof --metrics
+    // gld_efficiency,gst_efficiency,shared_efficiency ./your_prograoor = 0)
+    lin_solve_kernel_optimized<<<gridDim, blockDim>>>(M, N, O, x, x0, a, c, 0,
+                                                      instance.max_change);
 
     // Black sweep (color = 1)
-    lin_solve_kernel<<<gridDim, blockDim>>>(M, N, O, x, x0, a, c, 1,
-                                            instance.max_change);
+    lin_solve_kernel_optimized<<<gridDim, blockDim>>>(M, N, O, x, x0, a, c, 1,
+                                                      instance.max_change);
 
     check_convergence_kernel<<<1, 1>>>(instance.max_change, tol, converged);
-
-    // Handle boundary conditions
-    set_bnd_cuda(M, N, O, b, x);
 
     // Copy max_change back to host to check convergence
     cudaMemcpy(&converged_host, converged, sizeof(bool),
                cudaMemcpyDeviceToHost);
+
+    // Handle boundary conditions
+    set_bnd_cuda(M, N, O, b, x);
 
     iteration++;
   } while (!converged_host && iteration < max_iterations);

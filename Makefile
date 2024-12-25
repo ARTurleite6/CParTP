@@ -1,5 +1,5 @@
 CPP = nvcc
-CXXFLAGS = --std=c++17 -O3 
+CXXFLAGS = --std=c++17 -O3 -rdc=true
 SRCS = main.cu fluid_solver.cu EventManager.cpp resource_manager.cu
 
 all:
