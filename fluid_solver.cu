@@ -1,8 +1,12 @@
 #include "fluid_solver.h"
 #include "resource_manager.h"
 #include <algorithm>
+#include <cfloat>
+#include <cmath>
 #include <cuda_runtime.h>
 #include <math.h>
+#include <thrust/device_ptr.h>
+#include <thrust/reduce.h>
 
 #define BLOCK_SIZE 4
 
@@ -148,7 +152,7 @@ __global__ void set_bnd_corners(int M, int N, int O, float *x) {
 
 void set_bnd_cuda(int M, int N, int O, int b, float *x_dev) {
   // Set up dimensions for face kernels
-  dim3 blockDim(16, 16);
+  dim3 blockDim(8, 8);
 
   // For z-faces (M x N threads needed)
   dim3 gridDim_z((M + blockDim.x - 1) / blockDim.x,
@@ -169,110 +173,145 @@ void set_bnd_cuda(int M, int N, int O, int b, float *x_dev) {
   set_bnd_corners<<<1, 1>>>(M, N, O, x_dev);
 }
 
-__global__ void lin_solve_kernel_optimized(int M, int N, int O, float *x,
-                                           const float *x0, float a, float c,
-                                           int color, float *max_change) {
-  __shared__ float block_max[512];
-  int tid = threadIdx.x + threadIdx.y * blockDim.x +
-            threadIdx.z * blockDim.x * blockDim.y;
+__global__ void reduce_max(float *input, float *output, int n) {
+  extern __shared__ float sdata[];
+  int tid = threadIdx.x;
+  int idx = blockIdx.x * (blockDim.x * 8) + tid; // 8 elements per thread
 
-  // Each thread processes a 2x2x2 block of elements
-  int base_i = (blockIdx.x * blockDim.x + threadIdx.x) * 2 + 1;
-  int base_j = (blockIdx.y * blockDim.y + threadIdx.y) * 2 + 1;
-  int base_k = (blockIdx.z * blockDim.z + threadIdx.z) * 2 + 1;
-
-  float local_max = 0.0f;
-
-  // Process 8 elements (2x2x2 block)
-  for (int di = 0; di < 2; di++) {
-    for (int dj = 0; dj < 2; dj++) {
-      for (int dk = 0; dk < 2; dk++) {
-        int i = base_i + di;
-        int j = base_j + dj;
-        int k = base_k + dk;
-
-        if (i <= M && j <= N && k <= O && ((i + j + k) & 1) == color) {
-          // Check if this cell matches the current color pattern
-          float old_x = x[IX(i, j, k)];
-          float new_value = (x0[IX(i, j, k)] +
-                             a * (x[IX(i - 1, j, k)] + x[IX(i + 1, j, k)] +
-                                  x[IX(i, j - 1, k)] + x[IX(i, j + 1, k)] +
-                                  x[IX(i, j, k - 1)] + x[IX(i, j, k + 1)])) /
-                            c;
-          float change = fabsf(new_value - old_x);
-          local_max = fmaxf(local_max, change);
-          x[IX(i, j, k)] = new_value;
-        }
-      }
+  float thread_max = -FLT_MAX;
+#pragma unroll
+  for (int i = 0; i < 8; i++) {
+    if (idx + i * blockDim.x < n) {
+      thread_max = max(thread_max, input[idx + i * blockDim.x]);
     }
   }
 
-  // Reduction remains the same
-  block_max[tid] = local_max;
+  sdata[tid] = thread_max;
   __syncthreads();
 
-  for (int stride = blockDim.x * blockDim.y * blockDim.z / 2; stride > 0;
-       stride /= 2) {
-    if (tid < stride) {
-      block_max[tid] = fmaxf(block_max[tid], block_max[tid + stride]);
-    }
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (tid < s)
+      sdata[tid] = max(sdata[tid], sdata[tid + s]);
     __syncthreads();
   }
 
-  if (tid == 0) {
-    atomicMax((int *)max_change, __float_as_int(block_max[0]));
+  if (tid == 0)
+    output[blockIdx.x] = sdata[0];
+}
+
+// Função para encontrar o máximo global
+float find_max(float *d_input, float *partialMax, int size) {
+
+  int threadsPerBlock = 256;
+  constexpr int elementsPerThread = 8;
+  int numBlocks = (size + (threadsPerBlock * elementsPerThread) - 1) /
+                  (elementsPerThread * threadsPerBlock);
+
+  // float *d_partial_max;
+  // cudaMalloc((void **)&d_partial_max, numBlocks * sizeof(float));
+
+  int i = 0;
+  while (numBlocks > 1) {
+    ++i;
+    reduce_max<<<numBlocks, threadsPerBlock, threadsPerBlock * sizeof(float)>>>(
+        d_input, partialMax, size);
+    size = numBlocks;
+    numBlocks = (size + (threadsPerBlock * elementsPerThread) - 1) /
+                (elementsPerThread * threadsPerBlock);
+
+    // Troca os ponteiros para a próxima iteração
+    float *temp = d_input;
+    d_input = partialMax;
+    partialMax = temp;
+  }
+
+  // Última redução
+  reduce_max<<<1, threadsPerBlock, threadsPerBlock * sizeof(float)>>>(
+      d_input, partialMax, size);
+
+  // Copiar o resultado de volta para o host
+  float h_max;
+  cudaMemcpy(&h_max, partialMax, sizeof(float), cudaMemcpyDeviceToHost);
+
+  // cudaFree(d_partial_max);
+  return h_max;
+}
+
+__global__ void lin_solve_kernel_red(int M, int N, int O, float *x,
+                                     const float *x0, float a, float c,
+                                     float *changes) {
+
+  int i = (blockIdx.x * blockDim.x + threadIdx.x) + 1;
+  int j = (blockIdx.y * blockDim.y + threadIdx.y) + 1;
+  int k = (blockIdx.z * blockDim.z + threadIdx.z) + 1;
+
+  // float local_max = 0.0f;
+
+  if (i <= M && j <= N && k <= O) {
+    if ((i + j + k) % 2 == 0) {
+      // Check if this cell matches the current color pattern
+      int idx = IX(i, j, k);
+      float old_x = x[idx];
+      x[idx] = (x0[idx] + a * (x[IX(i - 1, j, k)] + x[IX(i + 1, j, k)] +
+                               x[IX(i, j - 1, k)] + x[IX(i, j + 1, k)] +
+                               x[IX(i, j, k - 1)] + x[IX(i, j, k + 1)])) /
+               c;
+      changes[idx] = fabs(x[idx] - old_x);
+    }
   }
 }
 
-__global__ void check_convergence_kernel(float *max_change, float tolerance,
-                                         bool *converged) {
-  if (threadIdx.x == 0 && blockIdx.x == 0) {
-    *converged = (*max_change < tolerance);
+__global__ void lin_solve_kernel_black(int M, int N, int O, float *x,
+                                       const float *x0, float a, float c,
+                                       float *changes) {
+  int i = (blockIdx.x * blockDim.x + threadIdx.x) + 1;
+  int j = (blockIdx.y * blockDim.y + threadIdx.y) + 1;
+  int k = (blockIdx.z * blockDim.z + threadIdx.z) + 1;
+
+  // float local_max = 0.0f;
+
+  if (i <= M && j <= N && k <= O) {
+    if ((i + j + k) % 2 != 0) {
+      // Check if this cell matches the current color pattern
+      int idx = IX(i, j, k);
+      float old_x = x[idx];
+      x[idx] = (x0[idx] + a * (x[IX(i - 1, j, k)] + x[IX(i + 1, j, k)] +
+                               x[IX(i, j - 1, k)] + x[IX(i, j + 1, k)] +
+                               x[IX(i, j, k - 1)] + x[IX(i, j, k + 1)])) /
+               c;
+      changes[idx - 1] = fabs(x[idx] - old_x);
+    }
   }
 }
 
-// Host function to manage the CUDA implementation
+// Modify your lin_solve_cuda function
 void lin_solve_cuda(int M, int N, int O, int b, float *x, float *x0, float a,
                     float c) {
   float tol = 1e-7;
+  float max_change;
   const int max_iterations = 20;
-  bool *converged;
-  bool converged_host = false;
-  cudaMalloc(&converged, sizeof(bool));
-
   auto &instance = ResourceManager::getInstance();
 
-  // Set up grid and block dimensions
-  dim3 blockDim(8, 8, 8);
-  dim3 gridDim((M / 2 + blockDim.x - 1) / blockDim.x,
-               (N / 2 + blockDim.y - 1) / blockDim.y,
-               (O / 2 + blockDim.z - 1) / blockDim.z);
+  dim3 blockDim(16, 16, 4);
+  dim3 gridDim((M + blockDim.x - 1) / blockDim.x,
+               (N + blockDim.y - 1) / blockDim.y,
+               (O + blockDim.z - 1) / blockDim.z);
 
   int iteration = 0;
   do {
-    // Reset max_change for this iteration
-    cudaMemset(instance.max_change, 0, sizeof(float));
+    cudaMemset(instance.changes, 0, instance.getSize() * sizeof(float));
 
-    // Red sweep (convprof --metrics
-    // gld_efficiency,gst_efficiency,shared_efficiency ./your_prograoor = 0)
-    lin_solve_kernel_optimized<<<gridDim, blockDim>>>(M, N, O, x, x0, a, c, 0,
-                                                      instance.max_change);
+    lin_solve_kernel_red<<<gridDim, blockDim>>>(M, N, O, x, x0, a, c,
+                                                instance.changes);
+    lin_solve_kernel_black<<<gridDim, blockDim>>>(M, N, O, x, x0, a, c,
+                                                  instance.changes);
 
-    // Black sweep (color = 1)
-    lin_solve_kernel_optimized<<<gridDim, blockDim>>>(M, N, O, x, x0, a, c, 1,
-                                                      instance.max_change);
+    max_change =
+        find_max(instance.changes, instance.partialMax, instance.getSize());
 
-    check_convergence_kernel<<<1, 1>>>(instance.max_change, tol, converged);
-
-    // Copy max_change back to host to check convergence
-    cudaMemcpy(&converged_host, converged, sizeof(bool),
-               cudaMemcpyDeviceToHost);
-
-    // Handle boundary conditions
     set_bnd_cuda(M, N, O, b, x);
 
-    iteration++;
-  } while (!converged_host && iteration < max_iterations);
+  } while (max_change > tol && ++iteration < max_iterations);
 }
 
 #if 0

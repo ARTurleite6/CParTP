@@ -10,7 +10,11 @@ ResourceManager::ResourceManager() : size((M + 2) * (N + 2) * (O + 2)) {
   cudaMalloc(&v0_dev, size * sizeof(float));
   cudaMalloc(&w_dev, size * sizeof(float));
   cudaMalloc(&w0_dev, size * sizeof(float));
-  cudaMalloc(&max_change, sizeof(float));
+  cudaMalloc(&changes, size * sizeof(float));
+
+  int threadsPerBlock = 256;
+  int numBlocks = (size + threadsPerBlock - 1) / threadsPerBlock;
+  cudaMalloc(&partialMax, numBlocks * sizeof(float));
 
   cudaMemset(d_dev, 0, size * sizeof(float));
   cudaMemset(d0_dev, 0, size * sizeof(float));
@@ -31,5 +35,5 @@ ResourceManager::~ResourceManager() {
   cudaFree(v0_dev);
   cudaFree(w_dev);
   cudaFree(w0_dev);
-  cudaFree(max_change);
+  cudaFree(changes);
 }

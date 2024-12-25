@@ -136,9 +136,6 @@ void simulate(EventManager &eventManager, int timesteps) {
 }
 
 int main() {
-  cudaSetDevice(0);
-
-  cudaProfilerStart();
   // Initialize EventManager
   EventManager eventManager;
   eventManager.read_events("events.txt");
@@ -166,8 +163,6 @@ int main() {
   if (err != cudaSuccess) {
     printf("Cuda Error: %s\n", cudaGetErrorString(err));
   }
-
-  cudaProfilerStop();
 
   return 0;
 }

@@ -10,6 +10,8 @@ class ResourceManager {
 public:
   float *d_dev, *d0_dev, *u_dev, *u0_dev, *v_dev, *v0_dev, *w_dev, *w0_dev;
   float *max_change;
+  float *changes;
+  float *partialMax;
 
 public:
   static ResourceManager &getInstance() {
