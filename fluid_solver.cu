@@ -237,50 +237,23 @@ float find_max(float *d_input, float *partialMax, int size) {
   return h_max;
 }
 
-__global__ void lin_solve_kernel_red(int M, int N, int O, float *x,
-                                     const float *x0, float a, float c,
-                                     float *changes) {
-
-  int i = (blockIdx.x * blockDim.x + threadIdx.x) + 1;
+__global__ void lin_solve_kernel(int M, int N, int O, float *x, const float *x0,
+                                 float a, float c, int color, float *changes) {
   int j = (blockIdx.y * blockDim.y + threadIdx.y) + 1;
   int k = (blockIdx.z * blockDim.z + threadIdx.z) + 1;
+  int i = 2 * (blockIdx.x * blockDim.x + threadIdx.x) + 1 + (j + k + color) % 2;
 
   // float local_max = 0.0f;
 
   if (i <= M && j <= N && k <= O) {
-    if ((i + j + k) % 2 == 0) {
-      // Check if this cell matches the current color pattern
-      int idx = IX(i, j, k);
-      float old_x = x[idx];
-      x[idx] = (x0[idx] + a * (x[IX(i - 1, j, k)] + x[IX(i + 1, j, k)] +
-                               x[IX(i, j - 1, k)] + x[IX(i, j + 1, k)] +
-                               x[IX(i, j, k - 1)] + x[IX(i, j, k + 1)])) /
-               c;
-      changes[idx] = fabs(x[idx] - old_x);
-    }
-  }
-}
-
-__global__ void lin_solve_kernel_black(int M, int N, int O, float *x,
-                                       const float *x0, float a, float c,
-                                       float *changes) {
-  int i = (blockIdx.x * blockDim.x + threadIdx.x) + 1;
-  int j = (blockIdx.y * blockDim.y + threadIdx.y) + 1;
-  int k = (blockIdx.z * blockDim.z + threadIdx.z) + 1;
-
-  // float local_max = 0.0f;
-
-  if (i <= M && j <= N && k <= O) {
-    if ((i + j + k) % 2 != 0) {
-      // Check if this cell matches the current color pattern
-      int idx = IX(i, j, k);
-      float old_x = x[idx];
-      x[idx] = (x0[idx] + a * (x[IX(i - 1, j, k)] + x[IX(i + 1, j, k)] +
-                               x[IX(i, j - 1, k)] + x[IX(i, j + 1, k)] +
-                               x[IX(i, j, k - 1)] + x[IX(i, j, k + 1)])) /
-               c;
-      changes[idx - 1] = fabs(x[idx] - old_x);
-    }
+    // Check if this cell matches the current color pattern
+    int idx = IX(i, j, k);
+    float old_x = x[idx];
+    x[idx] = (x0[idx] + a * (x[IX(i - 1, j, k)] + x[IX(i + 1, j, k)] +
+                             x[IX(i, j - 1, k)] + x[IX(i, j + 1, k)] +
+                             x[IX(i, j, k - 1)] + x[IX(i, j, k + 1)])) /
+             c;
+    changes[idx - 1] = fabs(x[idx] - old_x);
   }
 }
 
@@ -293,18 +266,17 @@ void lin_solve_cuda(int M, int N, int O, int b, float *x, float *x0, float a,
   auto &instance = ResourceManager::getInstance();
 
   dim3 blockDim(16, 16, 4);
-  dim3 gridDim((M + blockDim.x - 1) / blockDim.x,
+  dim3 gridDim(((M / 2) + blockDim.x - 1) / blockDim.x,
                (N + blockDim.y - 1) / blockDim.y,
                (O + blockDim.z - 1) / blockDim.z);
 
   int iteration = 0;
   do {
-    cudaMemset(instance.changes, 0, instance.getSize() * sizeof(float));
-
-    lin_solve_kernel_red<<<gridDim, blockDim>>>(M, N, O, x, x0, a, c,
-                                                instance.changes);
-    lin_solve_kernel_black<<<gridDim, blockDim>>>(M, N, O, x, x0, a, c,
-                                                  instance.changes);
+    cudaMemset(instance.changes, 0, sizeof(float) * instance.getSize());
+    lin_solve_kernel<<<gridDim, blockDim>>>(M, N, O, x, x0, a, c, 0,
+                                            instance.changes);
+    lin_solve_kernel<<<gridDim, blockDim>>>(M, N, O, x, x0, a, c, 1,
+                                            instance.changes);
 
     max_change =
         find_max(instance.changes, instance.partialMax, instance.getSize());
@@ -471,11 +443,11 @@ __global__ void compute_divergence_kernel(int M, int N, int O, const float *u,
 
 __global__ void update_velocity_kernel(int M, int N, int O, float *u, float *v,
                                        float *w, const float *p) {
-  int i = blockIdx.x * blockDim.x + threadIdx.x;
-  int j = blockIdx.y * blockDim.y + threadIdx.y;
-  int k = blockIdx.z * blockDim.z + threadIdx.z;
+  int i = blockIdx.x * blockDim.x + threadIdx.x + 1;
+  int j = blockIdx.y * blockDim.y + threadIdx.y + 1;
+  int k = blockIdx.z * blockDim.z + threadIdx.z + 1;
 
-  if (i >= 1 && i <= M && j >= 1 && j <= N && k >= 1 && k <= O) {
+  if (i <= M && j <= N && k <= O) {
     int idx = IX(i, j, k);
     u[idx] += -0.5f * (p[IX(i + 1, j, k)] - p[IX(i - 1, j, k)]);
     v[idx] += -0.5f * (p[IX(i, j + 1, k)] - p[IX(i, j - 1, k)]);
@@ -522,7 +494,7 @@ void project(int M, int N, int O, float *u, float *v, float *w, float *p,
 // divergence-free)
 void project_cuda(int M, int N, int O, float *u, float *v, float *w, float *p,
                   float *div) {
-  dim3 blockDim(8, 8, 8);
+  dim3 blockDim(16, 16, 4);
   dim3 gridDim((M + blockDim.x - 1) / blockDim.x,
                (N + blockDim.y - 1) / blockDim.y,
                (O + blockDim.z) / blockDim.z);
