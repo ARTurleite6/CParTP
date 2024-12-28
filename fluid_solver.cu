@@ -378,7 +378,7 @@ __global__ void advect_kernel(int M, int N, int O, int b, float *d, float *d0,
 void advect_cuda(int M, int N, int O, int b, float *d, float *d0, float *u,
                  float *v, float *w, float dt) {
   // Set up grid and block dimensions
-  dim3 blockDim(8, 8, 8);
+  dim3 blockDim(16, 16, 4);
   dim3 gridDim((M + blockDim.x - 1) / blockDim.x,
                (N + blockDim.y - 1) / blockDim.y,
                (O + blockDim.z - 1) / blockDim.z);
