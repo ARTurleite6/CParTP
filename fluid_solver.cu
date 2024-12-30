@@ -237,6 +237,45 @@ float find_max(float *d_input, float *partialMax, int size) {
   return h_max;
 }
 
+__global__ void lin_solve_kernel_with_shared(int M, int N, int O, float *x,
+                                             const float *x0, float a, float c,
+                                             int color, float *changes) {
+  extern __shared__ float s_x[];
+
+  int tx = threadIdx.x;
+  int ty = threadIdx.y;
+  int tz = threadIdx.z;
+
+  int i = blockIdx.x * (blockDim.x - 2) + tx;
+  int j = blockIdx.y * (blockDim.y - 2) + ty;
+  int k = blockIdx.z * (blockDim.z - 2) + tz;
+
+  int tid = (tz * (blockDim.y + 2) + ty) * (blockDim.x + 2) + tx;
+
+  if (i <= M + 1 && j <= N + 1 && k <= O + 1) {
+    s_x[tid] = x[IX(i, j, k)];
+  }
+
+  __syncthreads();
+
+  if (tx > 0 && tx < blockDim.x - 1 && ty > 0 && ty < blockDim.y - 1 &&
+      tz > 0 && tz < blockDim.z - 1 && i <= M && j <= N && k <= O &&
+      (i + j + k) % 2 == color) {
+    int idx = IX(i, j, k);
+    float old_x = s_x[tid];
+    float new_x =
+        (x0[idx] +
+         a * (s_x[tid - 1] + s_x[tid + 1] + s_x[tid - (blockDim.x + 2)] +
+              s_x[tid + (blockDim.x + 2)] +
+              s_x[tid - (blockDim.x + 2) * (blockDim.y + 2)] +
+              s_x[tid + (blockDim.x + 2) * (blockDim.y + 2)])) /
+        c;
+
+    x[idx] = new_x;
+    changes[idx - 1] = fabs(new_x - old_x);
+  }
+}
+
 __global__ void lin_solve_kernel(int M, int N, int O, float *x, const float *x0,
                                  float a, float c, int color, float *changes) {
   int j = (blockIdx.y * blockDim.y + threadIdx.y) + 1;
@@ -265,18 +304,21 @@ void lin_solve_cuda(int M, int N, int O, int b, float *x, float *x0, float a,
   const int max_iterations = 20;
   auto &instance = ResourceManager::getInstance();
 
-  dim3 blockDim(16, 16, 4);
-  dim3 gridDim(((M / 2) + blockDim.x - 1) / blockDim.x,
+  dim3 blockDim(8, 8, 8);
+  dim3 gridDim((M + blockDim.x - 1) / blockDim.x,
                (N + blockDim.y - 1) / blockDim.y,
                (O + blockDim.z - 1) / blockDim.z);
+
+  int shared_mem_size =
+      (blockDim.x + 2) * (blockDim.y + 2) * (blockDim.z + 2) * sizeof(float);
 
   int iteration = 0;
   do {
     cudaMemset(instance.changes, 0, sizeof(float) * instance.getSize());
-    lin_solve_kernel<<<gridDim, blockDim>>>(M, N, O, x, x0, a, c, 0,
-                                            instance.changes);
-    lin_solve_kernel<<<gridDim, blockDim>>>(M, N, O, x, x0, a, c, 1,
-                                            instance.changes);
+    lin_solve_kernel_with_shared<<<gridDim, blockDim, shared_mem_size>>>(
+        M, N, O, x, x0, a, c, 0, instance.changes);
+    lin_solve_kernel_with_shared<<<gridDim, blockDim, shared_mem_size>>>(
+        M, N, O, x, x0, a, c, 1, instance.changes);
 
     max_change =
         find_max(instance.changes, instance.partialMax, instance.getSize());
