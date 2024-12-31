@@ -1,6 +1,6 @@
 CPP = nvcc
 CXXFLAGS = --std=c++17 -O3  -Wno-deprecated-gpu-targets
-SRCS = main.cu fluid_solver.cu EventManager.cpp resource_manager.cu
+SRCS = main.cu fluid_solver.cu EventManager.cpp 
 
 all:
 	$(CPP) $(CXXFLAGS) $(SRCS) -o fluid_sim
@@ -8,8 +8,8 @@ all:
 run:
 	sbatch ./run.sh
 
-profile: all
-	/usr/lib/linux-tools-5.15.0-122/perf stat -r 3 -e instructions,cycles,L1-dcache-loads,L1-dcache-load-misses,branch,branch-misses ./fluid_sim
+copy-to-search:
+	scp -p run.sh $(SRCS) fluid_solver.h EventManager.h events.txt Makefile a97027@s7edu.di.uminho.pt:~/3dfluid
 
 runseq:
 	OMP_NUM_THREADS=1 ./fluid_sim

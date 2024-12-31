@@ -1,38 +1,54 @@
 #include "EventManager.h"
 #include "fluid_solver.h"
-#include "resource_manager.h"
 #include <cuda_profiler_api.h>
 #include <iostream>
+#include <optional>
 #include <vector>
 
+constexpr int SIZE{168};
 #define IX(i, j, k) ((i) + (M + 2) * (j) + (M + 2) * (N + 2) * (k))
+
+struct ChangeUVWValues {
+  int u, v, w;
+};
 
 // Globals for the grid size
 static float dt = 0.1f;      // Time delta
 static float diff = 0.0001f; // Diffusion constant
 static float visc = 0.0001f; // Viscosity constant
 
-static int M = ResourceManager::M;
-static int N = ResourceManager::N;
-static int O = ResourceManager::O;
+static int M = SIZE;
+static int N = SIZE;
+static int O = SIZE;
 
 // Fluid simulation arrays
 static float *u, *v, *w, *u_prev, *v_prev, *w_prev;
 static float *dens, *dens_prev;
+static float *d_dens;
+
+// helpers
+bool *d_converged;
 
 // Function to allocate simulation data
 int allocate_data() {
   int size = (M + 2) * (N + 2) * (O + 2);
-  u = new float[size];
-  v = new float[size];
-  w = new float[size];
-  u_prev = new float[size];
-  v_prev = new float[size];
-  w_prev = new float[size];
-  dens = new float[size];
-  dens_prev = new float[size];
 
-  if (!u || !v || !w || !u_prev || !v_prev || !w_prev || !dens || !dens_prev) {
+  dens = new float[size];
+
+  size *= sizeof(float);
+
+  cudaMalloc(&d_dens, size);
+  cudaMalloc(&dens_prev, size);
+  cudaMalloc(&u, size);
+  cudaMalloc(&u_prev, size);
+  cudaMalloc(&v, size);
+  cudaMalloc(&v_prev, size);
+  cudaMalloc(&w, size);
+  cudaMalloc(&w_prev, size);
+
+  cudaMalloc(&d_converged, sizeof(bool));
+
+  if (!dens) {
     std::cerr << "Cannot allocate memory" << std::endl;
     return 0;
   }
@@ -41,67 +57,67 @@ int allocate_data() {
 
 // Function to clear the data (set all to zero)
 void clear_data() {
-  int size = (M + 2) * (N + 2) * (O + 2);
-  for (int i = 0; i < size; i++) {
-    u[i] = v[i] = w[i] = u_prev[i] = v_prev[i] = w_prev[i] = dens[i] =
-        dens_prev[i] = 0.0f;
-  }
+  int size = (M + 2) * (N + 2) * (O + 2) * sizeof(float);
+
+  cudaMemset(d_dens, 0, size);
+  cudaMemset(dens_prev, 0, size);
+  cudaMemset(u, 0, size);
+  cudaMemset(u_prev, 0, size);
+  cudaMemset(v, 0, size);
+  cudaMemset(v_prev, 0, size);
+  cudaMemset(w, 0, size);
+  cudaMemset(w_prev, 0, size);
 }
 
 // Free allocated memory
 void free_data() {
-  delete[] u;
-  delete[] v;
-  delete[] w;
-  delete[] u_prev;
-  delete[] v_prev;
-  delete[] w_prev;
+  cudaFree(d_dens);
+  cudaFree(dens_prev);
+  cudaFree(u);
+  cudaFree(u_prev);
+  cudaFree(v);
+  cudaFree(v_prev);
+  cudaFree(w);
+  cudaFree(w_prev);
+  cudaFree(d_converged);
   delete[] dens;
-  delete[] dens_prev;
 }
 
 __global__ void update_dens(int index, float *dens_dev, float value) {
-  if (threadIdx.x == 0 && blockIdx.x == 0) {
-    dens_dev[index] = value;
-  }
+  dens_dev[index] = value;
 }
 
 __global__ void update_uvw(int index, float *u_dev, float *v_dev, float *w_dev,
                            float u_value, float v_value, float w_value) {
-  if (threadIdx.x == 0 && blockIdx.x == 0) {
-    u_dev[index] = u_value;
-    v_dev[index] = v_value;
-    w_dev[index] = w_value;
-  }
+  u_dev[index] = u_value;
+  v_dev[index] = v_value;
+  w_dev[index] = w_value;
 }
 
 // Apply events (source or force) for the current timestep
-void apply_events(const std::vector<Event> &events, ResourceManager &rm) {
+void apply_events(const std::vector<Event> &events) {
   int i = M / 2, j = N / 2, k = O / 2;
   const auto index = IX(i, j, k);
-  bool changed_dens = false;
-  bool changed_uvw = false;
+  std::optional<float> change_dens = std::nullopt;
+  std::optional<ChangeUVWValues> change_uvw = std::nullopt;
   for (const auto &event : events) {
     if (event.type == ADD_SOURCE) {
       // Apply density source at the center of the grid
-      dens[index] = event.density;
-      changed_dens = true;
+      change_dens = event.density;
     } else if (event.type == APPLY_FORCE) {
       // Apply forces based on the event's vector (fx, fy, fz)
-      u[index] = event.force.x;
-      v[index] = event.force.y;
-      w[index] = event.force.z;
-      changed_uvw = true;
+      change_uvw = ChangeUVWValues{
+          .u = event.force.x, .v = event.force.y, .w = event.force.z};
     }
   }
 
-  if (changed_dens) {
-    update_dens<<<1, 1>>>(index, rm.d_dev, dens[index]);
+  if (change_dens.has_value()) {
+    update_dens<<<1, 1>>>(index, d_dens, change_dens.value());
   }
 
-  if (changed_uvw) {
-    update_uvw<<<1, 1>>>(index, rm.u_dev, rm.v_dev, rm.w_dev, u[index],
-                         v[index], w[index]);
+  if (change_uvw.has_value()) {
+    const auto value = change_uvw.value();
+    update_uvw<<<1, 1>>>(index, u, v, w, value.u, value.v, value.w);
   }
 }
 
@@ -117,22 +133,18 @@ float sum_density() {
 
 // Simulation loop
 void simulate(EventManager &eventManager, int timesteps) {
-  ResourceManager &instance = ResourceManager::getInstance();
-
   for (int t = 0; t < timesteps; t++) {
     // Get the events for the current timestep
     std::vector<Event> events = eventManager.get_events_at_timestamp(t);
 
-    apply_events(events, instance);
+    apply_events(events);
 
     // Perform the simulation steps
-    vel_step_cuda(M, N, O, instance.u_dev, instance.v_dev, instance.w_dev,
-                  instance.u0_dev, instance.v0_dev, instance.w0_dev, visc, dt);
-    dens_step_cuda(M, N, O, instance.d_dev, instance.d0_dev, instance.u_dev,
-                   instance.v_dev, instance.w_dev, diff, dt);
+    vel_step_cuda(M, N, O, u, v, w, u_prev, v_prev, w_prev, visc, dt);
+    dens_step_cuda(M, N, O, d_dens, dens_prev, u, v, w, diff, dt);
   }
-  cudaMemcpy(dens, instance.d_dev, sizeof(float) * instance.getSize(),
-             cudaMemcpyDeviceToHost);
+  int size = (M + 2) * (N + 2) * (O + 2);
+  cudaMemcpy(dens, d_dens, sizeof(float) * size, cudaMemcpyDeviceToHost);
 }
 
 int main() {
