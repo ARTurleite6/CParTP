@@ -4,5 +4,5 @@
 #SBATCH --constraint=k20
 #SBATCH --exclusive
 
-nvprof ./fluid_sim
+time ./fluid_sim
 
